@@ -745,12 +745,11 @@ def save_samples_npz(model_single, batch, args, z_shapes, device, step):
     np.savez(out_path, **save_dict)
     print(f"[samples] saved to {out_path}")
 
-    if args.save_sample_images:
+    if args.save_sample_images and args.train_mode == "prediction":
         save_sample_visualizations(
             out_dir=out_dir,
             step=step,
-            conditional_samples=conditional_samples,
-            unconditional_samples=unconditional_samples,
+            prediction_samples=conditional_samples,
             gt=np.array(sample_gt.cpu().data),
             history_data=(
                 np.array(sample_batch["history_data"].cpu().data)
@@ -948,51 +947,61 @@ def save_single_visualization(image_path, title, pred_xy, gt_xy, history_xy, map
             limit_paths.append(vis_valid_path(gt_xy, agent_idx, timestep_mask))
     xlim, ylim = vis_compute_limits(map_xy, map_mask, limit_paths, args.vis_pad)
 
-    fig, axes = plt.subplots(1, 2, figsize=(15, 7.5))
+    fig, ax = plt.subplots(figsize=(9.5, 9.5))
     fig.patch.set_facecolor("#ffffff")
-    panels = [
-        (axes[0], "Ground Truth Future", gt_xy, "#2563eb"),
-        (axes[1], title, pred_xy, "#ea580c"),
+
+    vis_setup_axis(ax, map_data, map_xy, map_mask, map_type, xlim, ylim)
+    handles = [
+        Line2D([0], [0], color=style["color"], linewidth=style["lw"], alpha=style["alpha"], label=style["label"])
+        for style in MAP_STYLE.values()
+    ] + [
+        Line2D([0], [0], color="#ef4444", linestyle="--", linewidth=1.0, label="[-1, 1] box"),
     ]
 
-    for ax, panel_title, traj_xy, future_color in panels:
-        vis_setup_axis(ax, map_data, map_xy, map_mask, map_type, xlim, ylim)
-        handles = [
-            Line2D([0], [0], color=style["color"], linewidth=style["lw"], alpha=style["alpha"], label=style["label"])
-            for style in MAP_STYLE.values()
-        ] + [
-            Line2D([0], [0], color="#ef4444", linestyle="--", linewidth=1.0, label="[-1, 1] box"),
-        ]
-        if history_xy is not None:
-            handle = vis_draw_paths(
-                ax,
-                history_xy,
-                agent_indices,
-                history_timestep_mask,
-                color="#64748b",
-                label="history",
-                linestyle="-",
-                linewidth=1.8,
-                alpha=0.9,
-            )
-            if handle is not None:
-                handles.append(Line2D([0], [0], color="#64748b", linewidth=1.8, label="history"))
-        if traj_xy is not None:
-            handle = vis_draw_paths(
-                ax,
-                traj_xy,
-                agent_indices,
-                timestep_mask,
-                color=future_color,
-                label="future",
-                linestyle="-",
-                linewidth=2.2,
-                alpha=0.95,
-            )
-            if handle is not None:
-                handles.append(Line2D([0], [0], color=future_color, linewidth=2.2, label="future"))
-        ax.set_title(f"{panel_title} | {map_name}")
-        ax.legend(handles=handles, loc="upper right", fontsize=8, frameon=True)
+    if history_xy is not None:
+        handle = vis_draw_paths(
+            ax,
+            history_xy,
+            agent_indices,
+            history_timestep_mask,
+            color="#64748b",
+            label="history",
+            linestyle="-",
+            linewidth=1.8,
+            alpha=0.9,
+        )
+        if handle is not None:
+            handles.append(Line2D([0], [0], color="#64748b", linewidth=1.8, label="history"))
+    if gt_xy is not None:
+        handle = vis_draw_paths(
+            ax,
+            gt_xy,
+            agent_indices,
+            timestep_mask,
+            color="#2563eb",
+            label="gt future",
+            linestyle="-",
+            linewidth=2.2,
+            alpha=0.95,
+        )
+        if handle is not None:
+            handles.append(Line2D([0], [0], color="#2563eb", linewidth=2.2, label="gt future"))
+    if pred_xy is not None:
+        handle = vis_draw_paths(
+            ax,
+            pred_xy,
+            agent_indices,
+            timestep_mask,
+            color="#ea580c",
+            label="prediction",
+            linestyle="-",
+            linewidth=2.2,
+            alpha=0.95,
+        )
+        if handle is not None:
+            handles.append(Line2D([0], [0], color="#ea580c", linewidth=2.2, label="prediction"))
+    ax.set_title(f"{title} | {map_name}")
+    ax.legend(handles=handles, loc="upper right", fontsize=8, frameon=True)
 
     fig.tight_layout()
     image_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1003,8 +1012,7 @@ def save_single_visualization(image_path, title, pred_xy, gt_xy, history_xy, map
 def save_sample_visualizations(
     out_dir,
     step,
-    conditional_samples,
-    unconditional_samples,
+    prediction_samples,
     gt,
     history_data,
     map_data,
@@ -1019,33 +1027,17 @@ def save_sample_visualizations(
     image_dir.mkdir(parents=True, exist_ok=True)
 
     num_scenes = min(args.vis_num_scenes, gt.shape[0])
-    num_modes = min(args.vis_num_modes, conditional_samples.shape[0], unconditional_samples.shape[0])
+    num_modes = min(args.vis_num_modes, prediction_samples.shape[0])
 
     for scene_idx in range(num_scenes):
         scene_name = str(map_name[scene_idx]) if np.ndim(map_name) > 0 else str(map_name)
         for mode_idx in range(num_modes):
-            cond_path = image_dir / f"scene{scene_idx:03d}_mode{mode_idx:02d}_conditional.png"
-            uncond_path = image_dir / f"scene{scene_idx:03d}_mode{mode_idx:02d}_unconditional.png"
+            image_path = image_dir / f"scene{scene_idx:03d}_mode{mode_idx:02d}_prediction.png"
 
             save_single_visualization(
-                image_path=cond_path,
-                title=f"Conditional | mode {mode_idx}",
-                pred_xy=conditional_samples[mode_idx, scene_idx],
-                gt_xy=gt[scene_idx],
-                history_xy=history_data[scene_idx] if history_data is not None else None,
-                map_data=map_data[scene_idx],
-                map_mask=map_mask[scene_idx],
-                map_type=map_type[scene_idx] if map_type is not None else None,
-                map_name=scene_name,
-                target_vehicle_mask=target_vehicle_mask[scene_idx],
-                timestep_mask=timestep_mask[scene_idx],
-                history_timestep_mask=vis_history_mask(history_data[scene_idx:scene_idx + 1])[0] if history_data is not None else None,
-                args=args,
-            )
-            save_single_visualization(
-                image_path=uncond_path,
-                title=f"Unconditional | mode {mode_idx}",
-                pred_xy=unconditional_samples[mode_idx, scene_idx],
+                image_path=image_path,
+                title=f"Prediction | mode {mode_idx}",
+                pred_xy=prediction_samples[mode_idx, scene_idx],
                 gt_xy=gt[scene_idx],
                 history_xy=history_data[scene_idx] if history_data is not None else None,
                 map_data=map_data[scene_idx],
