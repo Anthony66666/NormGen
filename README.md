@@ -113,11 +113,16 @@ bash scripts/train.sh
 Any extra arguments after the dataset path are passed to `train_combined.py`:
 
 ```bash
-bash scripts/train.sh /data/interaction_multi_train_combined.npz --batch 4 --iter 100000
+bash scripts/train.sh /data/interaction_multi_train_combined.npz --batch 4 --epochs 50
 ```
 
 `--batch` is the per-GPU batch size. With 4 GPUs and `--batch 8`, the global
 batch size is 32.
+
+Training is epoch-based. Sampling, visualization, and periodic checkpoints are
+still triggered by global step intervals such as `--sample_interval 2000` and
+`--save_interval 2000`. The latest full checkpoint is also saved at epoch end
+by default with `--save_epoch_interval 1`.
 
 Single-node multi-GPU training:
 

@@ -177,13 +177,35 @@ def torch_load_checkpoint(path, map_location="cpu", weights_only=False):
         return torch.load(path, map_location=map_location)
 
 
-def save_training_checkpoint(path, model, optimizer, scheduler, scaler, args, step):
+def save_training_checkpoint(
+    path,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    args,
+    step,
+    epoch,
+    epoch_step,
+    steps_per_epoch,
+):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    next_epoch_step = int(epoch_step) + 1
+    next_epoch = int(epoch)
+    if next_epoch_step >= int(steps_per_epoch):
+        next_epoch += 1
+        next_epoch_step = 0
     payload = {
-        "format_version": 2,
+        "format_version": 3,
         "step": int(step),
+        "global_step": int(step),
         "next_iter": int(step) + 1,
+        "epoch": int(epoch),
+        "epoch_step": int(epoch_step),
+        "next_epoch": int(next_epoch),
+        "next_epoch_step": int(next_epoch_step),
+        "steps_per_epoch": int(steps_per_epoch),
         "model_state": unwrap_model(model).state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
@@ -215,7 +237,7 @@ def load_training_checkpoint(path, model, optimizer=None, scheduler=None, scaler
             scheduler.load_state_dict(ckpt["scheduler_state"])
         if load_optimizer and scaler is not None and ckpt.get("scaler_state") is not None:
             scaler.load_state_dict(ckpt["scaler_state"])
-        return ckpt.get("next_iter")
+        return ckpt
 
     missing, unexpected = model.load_state_dict(normalize_state_dict_keys(ckpt), strict=False)
     print(f"[checkpoint] loaded legacy state dict: {path}; missing={len(missing)} unexpected={len(unexpected)}")
@@ -1028,9 +1050,9 @@ def train(local_rank, world_size, args, rank=None):
     use_amp = args.amp and torch.cuda.is_available()
     scaler = make_grad_scaler(enabled=use_amp)
 
-    resume_next_iter = None
+    resume_checkpoint = None
     if args.resume_path:
-        resume_next_iter = load_training_checkpoint(
+        resume_checkpoint = load_training_checkpoint(
             args.resume_path,
             model_single,
             optimizer=optimizer,
@@ -1048,10 +1070,21 @@ def train(local_rank, world_size, args, rank=None):
             if opt_state is not None:
                 optimizer.load_state_dict(opt_state)
 
-    if args.resume_path and resume_next_iter is not None and not args.no_resume_iter:
-        args.start_iter = int(resume_next_iter)
+    resume_epoch_step = 0
+    if args.resume_path and resume_checkpoint is not None and not args.no_resume_iter:
+        args.start_iter = int(
+            resume_checkpoint.get(
+                "next_iter",
+                resume_checkpoint.get("global_step", resume_checkpoint.get("step", -1) + 1),
+            )
+        )
+        args.start_epoch = int(resume_checkpoint.get("next_epoch", resume_checkpoint.get("epoch", args.start_epoch)))
+        resume_epoch_step = int(resume_checkpoint.get("next_epoch_step", 0))
         if is_main:
-            print(f"[checkpoint] resume start_iter set to {args.start_iter}")
+            print(
+                "[checkpoint] resume position set to "
+                f"epoch={args.start_epoch}, epoch_step={resume_epoch_step}, global_step={args.start_iter}"
+            )
 
     if args.compile and hasattr(torch, "compile"):
         if is_main:
@@ -1090,120 +1123,191 @@ def train(local_rank, world_size, args, rank=None):
         else:
             print("[tensorboard] tensorboard is not installed; scalar logging disabled")
 
-    total_steps = args.iter
-    start_iter = args.start_iter
-    epoch = 0
-    dataloader_iter = iter(dataloader)
-    progress = tqdm(range(start_iter, total_steps), ncols=120) if is_main else range(start_iter, total_steps)
+    steps_per_epoch = len(dataloader)
+    global_step = int(args.start_iter)
+    max_steps = int(args.max_steps) if args.max_steps is not None and args.max_steps > 0 else None
+    if is_main:
+        limit_msg = f", max_steps={max_steps}" if max_steps is not None else ""
+        print(
+            f"[train] epoch-based loop: epochs={args.epochs}, "
+            f"start_epoch={args.start_epoch}, steps_per_epoch={steps_per_epoch}, "
+            f"start_global_step={global_step}{limit_msg}"
+        )
 
-    for i in progress:
-        if sampler is not None and (i == start_iter or (i - start_iter) % len(dataloader) == 0):
+    stop_training = False
+    for epoch in range(int(args.start_epoch), int(args.epochs)):
+        if sampler is not None:
             sampler.set_epoch(epoch)
-            epoch += 1
-            dataloader_iter = iter(dataloader)
 
-        try:
-            batch_raw = next(dataloader_iter)
-        except StopIteration:
-            if sampler is not None:
-                sampler.set_epoch(epoch)
-                epoch += 1
-            dataloader_iter = iter(dataloader)
-            batch_raw = next(dataloader_iter)
-
-        batch = process_batch(batch_raw, device, train_mode=args.train_mode)
-        target_data = batch["target_data"]
-        labels = batch["labels"]
-        map_data = batch["map_data"]
-
-        bad_input = torch.isnan(map_data).any() or torch.isnan(target_data).any()
-        if distributed_bad_flag(bad_input, is_distributed, device):
-            if is_main:
-                print(f"[Iter {i}] NaN detected in input tensors, skip batch on all ranks")
-            continue
-
-        use_conditional = distributed_label_condition(
-            args.train_mode,
-            args.label_keep_prob,
-            is_distributed,
-            device,
-        )
-        condition_input = labels if use_conditional else None
-
-        with cuda_autocast(enabled=use_amp):
-            log_p, logdet, _ = model(
-                target_data,
-                condition=condition_input,
-                **build_model_context_kwargs(batch, train_mode=args.train_mode),
-            )
-            nll_per_scene = -(logdet + log_p)
-            valid_dims = valid_dimension_count(batch, args.in_channel)
-            nll_per_valid_dim = nll_per_scene / valid_dims
-            if args.loss_normalize == "valid_dim":
-                loss_value = nll_per_valid_dim.mean()
-            else:
-                loss_value = nll_per_scene.mean()
-
-        bad_loss = (
-            torch.isnan(loss_value)
-            or torch.isinf(loss_value)
-            or torch.isnan(log_p).any()
-            or torch.isnan(logdet).any()
-        )
-        if distributed_bad_flag(bad_loss, is_distributed, device):
-            if is_main:
-                print(f"[Iter {i}] NaN/Inf detected, skip batch on all ranks")
-            optimizer.zero_grad(set_to_none=True)
-            continue
-
-        optimizer.zero_grad(set_to_none=True)
-        scaler.scale(loss_value).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-
-        old_scale = scaler.get_scale()
-        scaler.step(optimizer)
-        scaler.update()
-        new_scale = scaler.get_scale()
-        if old_scale <= new_scale:
-            scheduler.step()
-
+        iterable = enumerate(dataloader)
         if is_main:
-            log_p_mean = log_p.mean()
-            logdet_mean = logdet.mean()
-            nll_dim_mean = nll_per_valid_dim.mean()
-            progress.set_description(
-                f"Loss: {loss_value.item():.5f}; logP: {log_p_mean.item():.5f}; "
-                f"logdet: {logdet_mean.item():.5f}; "
-                f"nll/dim: {nll_dim_mean.item():.5f}; lr: {optimizer.param_groups[0]['lr']:.7f}"
+            progress = tqdm(
+                iterable,
+                total=steps_per_epoch,
+                ncols=120,
+                desc=f"Epoch {epoch + 1}/{args.epochs}",
             )
-            if writer is not None:
-                writer.add_scalar("train/loss", loss_value.item(), i)
-                writer.add_scalar("train/log_p", log_p_mean.item(), i)
-                writer.add_scalar("train/logdet", logdet_mean.item(), i)
-                writer.add_scalar("train/nll_per_valid_dim", nll_dim_mean.item(), i)
-                writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], i)
+        else:
+            progress = iterable
 
-        if is_main and (i % args.sample_interval == 0 or i == start_iter + 20):
-            with torch.no_grad():
-                save_samples_npz(model_single, batch, args, z_shapes, device, i)
+        last_epoch_step = None
+        for epoch_step, batch_raw in progress:
+            if epoch == int(args.start_epoch) and epoch_step < resume_epoch_step:
+                continue
 
-        if is_main and (i % args.save_interval == 0):
+            i = global_step
+
+            batch = process_batch(batch_raw, device, train_mode=args.train_mode)
+            target_data = batch["target_data"]
+            labels = batch["labels"]
+            map_data = batch["map_data"]
+
+            bad_input = torch.isnan(map_data).any() or torch.isnan(target_data).any()
+            if distributed_bad_flag(bad_input, is_distributed, device):
+                if is_main:
+                    print(f"[Step {i}] NaN detected in input tensors, skip batch on all ranks")
+                continue
+
+            use_conditional = distributed_label_condition(
+                args.train_mode,
+                args.label_keep_prob,
+                is_distributed,
+                device,
+            )
+            condition_input = labels if use_conditional else None
+
+            with cuda_autocast(enabled=use_amp):
+                log_p, logdet, _ = model(
+                    target_data,
+                    condition=condition_input,
+                    **build_model_context_kwargs(batch, train_mode=args.train_mode),
+                )
+                nll_per_scene = -(logdet + log_p)
+                valid_dims = valid_dimension_count(batch, args.in_channel)
+                nll_per_valid_dim = nll_per_scene / valid_dims
+                if args.loss_normalize == "valid_dim":
+                    loss_value = nll_per_valid_dim.mean()
+                else:
+                    loss_value = nll_per_scene.mean()
+
+            bad_loss = (
+                torch.isnan(loss_value)
+                or torch.isinf(loss_value)
+                or torch.isnan(log_p).any()
+                or torch.isnan(logdet).any()
+            )
+            if distributed_bad_flag(bad_loss, is_distributed, device):
+                if is_main:
+                    print(f"[Step {i}] NaN/Inf detected, skip batch on all ranks")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss_value).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+
+            old_scale = scaler.get_scale()
+            scaler.step(optimizer)
+            scaler.update()
+            new_scale = scaler.get_scale()
+            if old_scale <= new_scale:
+                scheduler.step()
+
+            completed_step = global_step + 1
+            if is_main:
+                log_p_mean = log_p.mean()
+                logdet_mean = logdet.mean()
+                nll_dim_mean = nll_per_valid_dim.mean()
+                progress.set_description(
+                    f"Epoch {epoch + 1}/{args.epochs}; step: {completed_step}; "
+                    f"Loss: {loss_value.item():.5f}; logP: {log_p_mean.item():.5f}; "
+                    f"logdet: {logdet_mean.item():.5f}; "
+                    f"nll/dim: {nll_dim_mean.item():.5f}; lr: {optimizer.param_groups[0]['lr']:.7f}"
+                )
+                if writer is not None:
+                    writer.add_scalar("train/loss", loss_value.item(), global_step)
+                    writer.add_scalar("train/log_p", log_p_mean.item(), global_step)
+                    writer.add_scalar("train/logdet", logdet_mean.item(), global_step)
+                    writer.add_scalar("train/nll_per_valid_dim", nll_dim_mean.item(), global_step)
+                    writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
+                    writer.add_scalar("train/epoch", epoch, global_step)
+
+            if is_main and args.sample_interval > 0 and completed_step % args.sample_interval == 0:
+                with torch.no_grad():
+                    save_samples_npz(model_single, batch, args, z_shapes, device, completed_step - 1)
+
+            if is_main and args.save_interval > 0 and completed_step % args.save_interval == 0:
+                ckpt_dir = Path(args.ckpt_dir)
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                last_path = ckpt_dir / "last.pt"
+                save_training_checkpoint(
+                    last_path,
+                    model_single,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    args,
+                    completed_step - 1,
+                    epoch,
+                    epoch_step,
+                    steps_per_epoch,
+                )
+                if args.save_step_checkpoints:
+                    step_path = ckpt_dir / f"step_{completed_step:06d}.pt"
+                    save_training_checkpoint(
+                        step_path,
+                        model_single,
+                        optimizer,
+                        scheduler,
+                        scaler,
+                        args,
+                        completed_step - 1,
+                        epoch,
+                        epoch_step,
+                        steps_per_epoch,
+                    )
+                print(f"[rank {rank}] saved checkpoint: {last_path}")
+
+            if is_main and args.keep_legacy_checkpoints and args.save_interval > 0 and completed_step % args.save_interval == 0:
+                model_path = ckpt_dir / "model_interaction_combined.pt"
+                optim_path = ckpt_dir / "optim_interaction_combined.pt"
+                torch.save(unwrap_model(model_single).state_dict(), model_path)
+                torch.save(optimizer.state_dict(), optim_path)
+                print(f"[rank {rank}] saved legacy checkpoints: {model_path}, {optim_path}")
+
+            global_step = completed_step
+            last_epoch_step = epoch_step
+            if max_steps is not None and global_step >= max_steps:
+                stop_training = True
+                break
+
+        resume_epoch_step = 0
+        if (
+            is_main
+            and not stop_training
+            and last_epoch_step is not None
+            and args.save_epoch_interval > 0
+            and (epoch + 1) % args.save_epoch_interval == 0
+        ):
             ckpt_dir = Path(args.ckpt_dir)
             ckpt_dir.mkdir(parents=True, exist_ok=True)
             last_path = ckpt_dir / "last.pt"
-            save_training_checkpoint(last_path, model_single, optimizer, scheduler, scaler, args, i)
-            if args.save_step_checkpoints:
-                step_path = ckpt_dir / f"step_{i + 1:06d}.pt"
-                save_training_checkpoint(step_path, model_single, optimizer, scheduler, scaler, args, i)
-            print(f"[rank {rank}] saved checkpoint: {last_path}")
-
-        if is_main and args.keep_legacy_checkpoints and (i % args.save_interval == 0):
-            model_path = ckpt_dir / "model_interaction_combined.pt"
-            optim_path = ckpt_dir / "optim_interaction_combined.pt"
-            torch.save(unwrap_model(model_single).state_dict(), model_path)
-            torch.save(optimizer.state_dict(), optim_path)
-            print(f"[rank {rank}] saved legacy checkpoints: {model_path}, {optim_path}")
+            save_training_checkpoint(
+                last_path,
+                model_single,
+                optimizer,
+                scheduler,
+                scaler,
+                args,
+                global_step - 1,
+                epoch,
+                last_epoch_step,
+                steps_per_epoch,
+            )
+            print(f"[rank {rank}] saved epoch checkpoint: {last_path}")
+        if stop_training:
+            break
 
     if writer is not None:
         writer.close()
@@ -1221,9 +1325,12 @@ def main():
         type=str,
         help="path to combined interaction npz",
     )
-    parser.add_argument("--batch", default=8, type=int, help="batch size")
-    parser.add_argument("--iter", default=600000, type=int, help="maximum iterations")
-    parser.add_argument("--start_iter", default=0, type=int, help="start iteration")
+    parser.add_argument("--batch", default=8, type=int, help="per-GPU batch size")
+    parser.add_argument("--epochs", default=100, type=int, help="number of training epochs")
+    parser.add_argument("--start_epoch", default=0, type=int, help="epoch index to start from")
+    parser.add_argument("--max_steps", default=-1, type=int, help="optional global-step cap; <=0 trains full epochs")
+    parser.add_argument("--iter", default=-1, type=int, help="deprecated alias for --max_steps")
+    parser.add_argument("--start_iter", default=0, type=int, help="global step to start logging/checkpoint numbering")
     parser.add_argument("--n_flow", default=16, type=int, help="number of flows per block")
     parser.add_argument("--n_block", default=3, type=int, help="number of blocks")
     parser.add_argument("--no_lu", action="store_true", help="disable LU conv")
@@ -1260,6 +1367,7 @@ def main():
                         help="dataloader prefetch factor when num_workers > 0; <=0 disables explicit setting")
     parser.add_argument("--sample_interval", default=2000, type=int, help="sample save interval")
     parser.add_argument("--save_interval", default=2000, type=int, help="checkpoint save interval")
+    parser.add_argument("--save_epoch_interval", default=1, type=int, help="save last.pt every N epochs; <=0 disables")
     parser.add_argument("--log_dir", default="./runs", type=str, help="tensorboard log dir")
     parser.add_argument("--ckpt_dir", default="./results", type=str, help="checkpoint dir")
     parser.add_argument("--sample_out_dir", default="./results", type=str, help="sample output dir")
@@ -1314,6 +1422,13 @@ def main():
     if not os.path.exists(args.combined_path):
         raise FileNotFoundError(f"combined dataset not found: {args.combined_path}")
 
+    if args.iter is not None and args.iter > 0 and args.max_steps <= 0:
+        args.max_steps = args.iter
+        print(f"[config] --iter is deprecated; using max_steps={args.max_steps}")
+    if args.epochs <= 0:
+        raise ValueError(f"epochs must be > 0, got {args.epochs}")
+    if args.start_epoch < 0:
+        raise ValueError(f"start_epoch must be >= 0, got {args.start_epoch}")
     if args.use_history and args.train_mode == "initialization":
         args.train_mode = "prediction"
         print("[config] --use_history is deprecated; switching train_mode to prediction")

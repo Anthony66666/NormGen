@@ -1,7 +1,10 @@
 combined_path: data/interaction_multi_train_combined.npz
 
 batch: 8
-iter: 600000
+epochs: 100
+start_epoch: 0
+max_steps: -1
+iter: -1
 start_iter: 0
 
 n_flow: 16
@@ -33,6 +36,7 @@ persistent_workers: true
 prefetch_factor: 2
 sample_interval: 2000
 save_interval: 2000
+save_epoch_interval: 1
 
 log_dir: ./runs
 ckpt_dir: ./results
