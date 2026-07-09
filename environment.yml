@@ -15,3 +15,4 @@ dependencies:
   - tqdm=4.66
   - matplotlib
   - tensorboard
+  - h5py

@@ -1,0 +1,13 @@
+# Dependencies needed by the upstream AutoBots repository.
+# Install these in the environment used to run AutoBots/train.py and AutoBots/evaluate.py.
+h5py>=3.8
+matplotlib>=3.7
+numpy>=1.23
+opencv-python>=4.8
+pandas>=1.5
+pyproj>=3.4
+pyquaternion>=0.9.9
+scikit-learn>=1.2
+scipy>=1.9
+tensorboard>=2.14
+torch>=2.0

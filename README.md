@@ -122,3 +122,126 @@ Outputs:
 - checkpoints: `results/model_interaction_combined.pt`, `results/optim_interaction_combined.pt`
 - samples: `results/*_interaction_combined_samples.npz`
 - TensorBoard logs: `runs/`
+
+## AutoBots Pipeline
+
+AutoBots does not train directly from NormGen NPZ files. Its Interaction-Dataset loader expects:
+
+```text
+DATASET_ROOT/
+  train_dataset.hdf5
+  val_dataset.hdf5
+  maps/*.osm
+```
+
+This repository provides a converter from NormGen output to that AutoBots HDF5 format.
+
+### 1. Clone AutoBots
+
+Put AutoBots next to this repository, or set `AUTOBOTS_ROOT` in `.env`:
+
+```bash
+git clone https://github.com/roggirg/AutoBots.git ../AutoBots
+```
+
+Install AutoBots dependencies in the environment you use to run AutoBots:
+
+```bash
+pip install -r requirements-autobots.txt
+```
+
+If your server already has a PyTorch/CUDA build installed, install the non-PyTorch packages first or adjust the requirements file to avoid replacing your CUDA-compatible torch build.
+
+### 2. Convert NormGen Output to AutoBots HDF5
+
+For a NormGen sample file from prediction mode:
+
+```bash
+INTERACTION_MAPS_ROOT=/path/to/INTERACTION-Dataset-DR-multi-v1_2/maps \
+bash scripts/prepare_autobots_dataset.sh results/000001_interaction_combined_samples.npz
+```
+
+For initialization mode samples, use the same command. The converter detects the format:
+
+- prediction samples: `history_data` + generated future `30` frames are combined into a `40` frame AutoBots trajectory.
+- initialization samples: generated `40` frame trajectories are used directly.
+- combined preprocessed NPZ files: original `trajectories + dimensions` are converted directly.
+
+By default, generated modes are expanded as separate AutoBots scenes. To use only one mode:
+
+```bash
+MODE_INDEX=0 bash scripts/prepare_autobots_dataset.sh /path/to/sample.npz
+```
+
+To use unconditional samples:
+
+```bash
+SAMPLE_KEY=unconditional_samples bash scripts/prepare_autobots_dataset.sh /path/to/sample.npz
+```
+
+To convert a preprocessed combined NPZ:
+
+```bash
+python tools/convert_normgen_to_autobots.py \
+  --input-npz /path/to/interaction_multi_train_combined.npz \
+  --output-dir autobots_data/real_train \
+  --source combined \
+  --val-ratio 0.1 \
+  --maps-root /path/to/INTERACTION-Dataset-DR-multi-v1_2/maps
+```
+
+The default output is:
+
+```text
+autobots_data/normgen_generated/
+  train_dataset.hdf5
+  val_dataset.hdf5
+  maps/*.osm
+```
+
+If `INTERACTION_MAPS_ROOT` is not set, the converter writes minimal dummy maps. That is enough for `USE_MAP_LANES=0`; for map-lane experiments, use the real INTERACTION maps.
+
+### 3. Train AutoBots on NormGen Data
+
+```bash
+AUTOBOTS_ROOT=../AutoBots \
+AUTOBOTS_DATASET_DIR=autobots_data/normgen_generated \
+bash scripts/train_autobots.sh
+```
+
+Useful overrides:
+
+```bash
+AUTOBOTS_EPOCHS=10 AUTOBOTS_BATCH_SIZE=16 bash scripts/train_autobots.sh
+```
+
+To train AutoBots with map lanes:
+
+```bash
+USE_MAP_LANES=1 INTERACTION_MAPS_ROOT=/path/to/INTERACTION-Dataset-DR-multi-v1_2/maps \
+bash scripts/prepare_autobots_dataset.sh /path/to/sample.npz
+USE_MAP_LANES=1 bash scripts/train_autobots.sh
+```
+
+### 4. Evaluate an AutoBots Checkpoint
+
+```bash
+bash scripts/eval_autobots.sh /path/to/best_models_fde.pth
+```
+
+The evaluation script uses `val_dataset.hdf5` from `AUTOBOTS_DATASET_DIR`.
+
+### Recommended Experiments
+
+Train/test combinations that match the paper-style question:
+
+1. Real-to-real baseline:
+   Convert real preprocessed train/val data and train AutoBots normally.
+2. Prediction-generated data:
+   Use NormGen prediction samples, convert them, train AutoBots, and evaluate on real val HDF5.
+3. Initialization-generated data:
+   Use NormGen initialization samples, convert them, train AutoBots, and evaluate on real val HDF5.
+4. Mixed real + generated:
+   Convert generated data and real data separately, then concatenate HDF5 files or train in stages.
+
+For strict evaluation, keep the AutoBots validation set real, not generated.
