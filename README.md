@@ -340,6 +340,7 @@ AUTOBOTS_EPOCHS=10 AUTOBOTS_BATCH_SIZE=16 bash scripts/train_autobots.sh
 ```
 
 `train_autobots.sh` creates a timestamped `EXP_ID` by default so repeated runs do not stop at AutoBots' overwrite prompt. Set `EXP_ID=my_run_name` when you want a fixed experiment directory.
+`AUTOBOTS_NUM_WORKERS=0` is the default because AutoBots hard-codes 12 DataLoader workers, which can hang on some servers. Increase it if your server handles multiprocessing well.
 
 To train AutoBots with map lanes:
 

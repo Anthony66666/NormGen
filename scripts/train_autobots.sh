@@ -16,6 +16,9 @@ AUTOBOTS_SAVE_DIR="${AUTOBOTS_SAVE_DIR:-$ROOT_DIR/autobots_runs}"
 EXP_ID="${EXP_ID:-normgen_$(date +%Y%m%d_%H%M%S)}"
 USE_MAP_LANES="${USE_MAP_LANES:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
+AUTOBOTS_NUM_WORKERS="${AUTOBOTS_NUM_WORKERS:-0}"
+MPLCONFIGDIR="${MPLCONFIGDIR:-$ROOT_DIR/server_workspace/matplotlib}"
+export AUTOBOTS_NUM_WORKERS MPLCONFIGDIR
 
 if [[ "$AUTOBOTS_DATASET_DIR" = /* ]]; then
   AUTOBOTS_DATASET_PATH="$AUTOBOTS_DATASET_DIR"
@@ -28,6 +31,7 @@ if [[ ! -d "$AUTOBOTS_ROOT" ]]; then
   echo "Set AUTOBOTS_ROOT in .env." >&2
   exit 1
 fi
+AUTOBOTS_ROOT_PATH="$(realpath "$AUTOBOTS_ROOT")"
 
 if [[ ! -f "$AUTOBOTS_DATASET_PATH/train_dataset.hdf5" || ! -f "$AUTOBOTS_DATASET_PATH/val_dataset.hdf5" ]]; then
   echo "Missing AutoBots train/val HDF5 files under $AUTOBOTS_DATASET_PATH." >&2
@@ -41,9 +45,9 @@ if [[ "$USE_MAP_LANES" == "1" || "$USE_MAP_LANES" == "true" || "$USE_MAP_LANES" 
 fi
 
 mkdir -p "$AUTOBOTS_SAVE_DIR"
+mkdir -p "$MPLCONFIGDIR"
 
-cd "$AUTOBOTS_ROOT"
-"$PYTHON_BIN" train.py \
+"$PYTHON_BIN" "$ROOT_DIR/tools/run_autobots_with_worker_patch.py" "$AUTOBOTS_ROOT_PATH/train.py" \
   --exp-id "$EXP_ID" \
   --dataset interaction-dataset \
   --model-type Autobot-Joint \

@@ -18,6 +18,10 @@ fi
 AUTOBOTS_ROOT="${AUTOBOTS_ROOT:-../AutoBots}"
 AUTOBOTS_DATASET_DIR="${AUTOBOTS_DATASET_DIR:-autobots_data/normgen_generated}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
+AUTOBOTS_NUM_WORKERS="${AUTOBOTS_NUM_WORKERS:-0}"
+MPLCONFIGDIR="${MPLCONFIGDIR:-$ROOT_DIR/server_workspace/matplotlib}"
+export AUTOBOTS_NUM_WORKERS MPLCONFIGDIR
+MODEL_PATH="$(realpath "$MODEL_PATH")"
 
 if [[ "$AUTOBOTS_DATASET_DIR" = /* ]]; then
   AUTOBOTS_DATASET_PATH="$AUTOBOTS_DATASET_DIR"
@@ -35,14 +39,17 @@ if [[ ! -d "$AUTOBOTS_ROOT" ]]; then
   echo "Missing AutoBots repo: $AUTOBOTS_ROOT" >&2
   exit 1
 fi
+AUTOBOTS_ROOT_PATH="$(realpath "$AUTOBOTS_ROOT")"
+mkdir -p "$MPLCONFIGDIR"
 
 if [[ ! -f "$AUTOBOTS_DATASET_PATH/val_dataset.hdf5" ]]; then
   echo "Missing val_dataset.hdf5 under $AUTOBOTS_DATASET_PATH." >&2
   exit 1
 fi
 
-cd "$AUTOBOTS_ROOT"
-"$PYTHON_BIN" evaluate.py \
+# AutoBots load_config mishandles absolute checkpoint paths unless cwd is /.
+cd /
+"$PYTHON_BIN" "$ROOT_DIR/tools/run_autobots_with_worker_patch.py" "$AUTOBOTS_ROOT_PATH/evaluate.py" \
   --models-path "$MODEL_PATH" \
   --dataset-path "$AUTOBOTS_DATASET_PATH" \
   --batch-size "${AUTOBOTS_EVAL_BATCH_SIZE:-16}" \
