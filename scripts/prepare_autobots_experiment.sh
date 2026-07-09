@@ -105,4 +105,5 @@ else
     "$@"
 fi
 
+"$PYTHON_BIN" tools/inspect_autobots_dataset.py --dataset-dir "$AUTOBOTS_DATASET_DIR"
 echo "[ok] AutoBots dataset ready: $AUTOBOTS_DATASET_DIR"

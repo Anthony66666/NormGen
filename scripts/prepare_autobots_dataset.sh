@@ -43,3 +43,5 @@ fi
   --val-ratio "$VAL_RATIO" \
   "${MAP_ARGS[@]}" \
   "$@"
+
+"$PYTHON_BIN" tools/inspect_autobots_dataset.py --dataset-dir "$AUTOBOTS_DATASET_DIR"

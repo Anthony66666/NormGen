@@ -13,7 +13,7 @@ fi
 AUTOBOTS_ROOT="${AUTOBOTS_ROOT:-../AutoBots}"
 AUTOBOTS_DATASET_DIR="${AUTOBOTS_DATASET_DIR:-autobots_data/normgen_generated}"
 AUTOBOTS_SAVE_DIR="${AUTOBOTS_SAVE_DIR:-$ROOT_DIR/autobots_runs}"
-EXP_ID="${EXP_ID:-normgen}"
+EXP_ID="${EXP_ID:-normgen_$(date +%Y%m%d_%H%M%S)}"
 USE_MAP_LANES="${USE_MAP_LANES:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 

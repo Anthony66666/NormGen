@@ -290,6 +290,11 @@ bash scripts/smoke_autobots_pipeline.sh /path/to/000001_interaction_combined_sam
 ```
 
 If the smoke check reports missing modules such as `pyproj` or `cv2`, install `requirements-autobots.txt` in the AutoBots environment.
+To inspect the HDF5 files without importing AutoBots:
+
+```bash
+python tools/inspect_autobots_dataset.py --dataset-dir autobots_data/prediction_generated_train_real_val
+```
 
 ### 3. Train AutoBots on NormGen Data
 
@@ -333,6 +338,8 @@ Useful overrides:
 ```bash
 AUTOBOTS_EPOCHS=10 AUTOBOTS_BATCH_SIZE=16 bash scripts/train_autobots.sh
 ```
+
+`train_autobots.sh` creates a timestamped `EXP_ID` by default so repeated runs do not stop at AutoBots' overwrite prompt. Set `EXP_ID=my_run_name` when you want a fixed experiment directory.
 
 To train AutoBots with map lanes:
 
