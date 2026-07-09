@@ -205,6 +205,15 @@ REAL_VAL_NPZ=/path/to/real_val_interaction_multi_combined.npz \
 bash scripts/prepare_autobots_experiment.sh
 ```
 
+Or run prepare + train + eval in one command:
+
+```bash
+AUTOBOTS_DATASET_DIR=autobots_data/prediction_generated_train_real_val \
+NORMGEN_TRAIN_NPZ=/path/to/prediction_samples.npz \
+REAL_VAL_NPZ=/path/to/real_val_interaction_multi_combined.npz \
+bash scripts/run_autobots_experiment.sh
+```
+
 ## AutoBots Pipeline
 
 AutoBots does not train directly from NormGen NPZ files. Its Interaction-Dataset loader expects:
@@ -297,6 +306,17 @@ python tools/inspect_autobots_dataset.py --dataset-dir autobots_data/prediction_
 ```
 
 ### 3. Train AutoBots on NormGen Data
+
+One-command experiment:
+
+```bash
+AUTOBOTS_DATASET_DIR=autobots_data/prediction_generated_train_real_val \
+NORMGEN_TRAIN_NPZ=/path/to/prediction_samples.npz \
+REAL_VAL_NPZ=/path/to/real_val_interaction_multi_combined.npz \
+bash scripts/run_autobots_experiment.sh
+```
+
+Set `RUN_EVAL=0` to skip evaluation. Set `EVAL_CHECKPOINT=/path/to/model.pth` to evaluate a specific checkpoint.
 
 For strict evaluation, prefer this command because it uses generated data for train and real data for validation:
 
