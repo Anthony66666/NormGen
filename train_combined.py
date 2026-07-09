@@ -752,60 +752,42 @@ def save_samples_npz(model_single, batch, args, z_shapes, device, step):
             conditional_samples=conditional_samples,
             unconditional_samples=unconditional_samples,
             gt=np.array(sample_gt.cpu().data),
+            history_data=(
+                np.array(sample_batch["history_data"].cpu().data)
+                if args.train_mode == "prediction" and sample_batch["history_data"] is not None
+                else None
+            ),
             map_data=np.array(sample_batch["map_data"].cpu().data),
             map_mask=np.array(sample_batch["map_mask"].cpu().data),
+            map_type=np.array(sample_map_type.cpu().data),
             map_name=np.array(sample_map_name),
-            agent_types=np.array(sample_batch["raw_agent_types"].cpu().data),
             target_vehicle_mask=np.array(sample_batch["target_vehicle_mask"].cpu().data),
             timestep_mask=np.array(sample_batch["timestep_mask"].cpu().data),
-            scene_stats=np.array(sample_scene_stats.cpu().data),
             args=args,
         )
 
 
 MAP_STYLE = {
-    "centerline": {"color": "#6f7d8c", "lw": 1.4, "alpha": 0.75},
-    "boundary": {"color": "#b9a27a", "lw": 1.0, "alpha": 0.55},
-    "crosswalk": {"color": "#d8c58a", "lw": 2.2, "alpha": 0.35},
-    "unknown": {"color": "#a0a0a0", "lw": 1.0, "alpha": 0.35},
-}
-
-AGENT_TYPE_COLORS = {
-    0: "#4c78a8",
-    1: "#1f77b4",
-    2: "#f58518",
-    3: "#54a24b",
-    4: "#e45756",
+    0: {"color": "#111827", "lw": 1.25, "alpha": 0.95, "label": "map centerline"},
+    1: {"color": "#9ca3af", "lw": 0.9, "alpha": 0.75, "label": "map boundary"},
+    2: {"color": "#f59e0b", "lw": 1.0, "alpha": 0.75, "label": "crosswalk"},
 }
 
 
-def vis_denormalize_map_xy(map_data, position_scale):
-    xy = map_data[..., :2].copy()
-    return xy * float(position_scale)
+def vis_traj_xy(traj):
+    return traj[:2].copy()
 
 
-def vis_denormalize_traj_xy(traj, position_scale):
-    xy = traj[:2].copy()
-    valid = ~np.isclose(xy, -1.0, atol=1e-4)
-    xy[valid] *= float(position_scale)
-    return xy
-
-
-def vis_infer_map_type(map_data, lane_idx, valid_len):
+def vis_infer_map_type(map_data, map_type, lane_idx, valid_len):
+    if map_type is not None and lane_idx < len(map_type):
+        return int(np.clip(map_type[lane_idx], 0, 2))
     if valid_len <= 0 or map_data.shape[-1] < 6:
-        return "unknown"
+        return -1
     type_scores = np.mean(map_data[lane_idx, :valid_len, 3:6], axis=0)
-    type_idx = int(np.argmax(type_scores))
-    if type_idx == 0:
-        return "centerline"
-    if type_idx == 1:
-        return "boundary"
-    if type_idx == 2:
-        return "crosswalk"
-    return "unknown"
+    return int(np.argmax(type_scores))
 
 
-def vis_valid_path(traj_xy, agent_idx, timestep_mask):
+def vis_valid_path(traj_xy, agent_idx, timestep_mask=None):
     path = traj_xy[:, :, agent_idx].T
     if timestep_mask is not None:
         valid_t = timestep_mask[:, agent_idx]
@@ -813,14 +795,18 @@ def vis_valid_path(traj_xy, agent_idx, timestep_mask):
             return None
         path = path[valid_t]
     else:
-        valid_t = ~(np.isclose(path[:, 0], -1.0, atol=1e-4) & np.isclose(path[:, 1], -1.0, atol=1e-4))
+        valid_t = ~(
+            np.isclose(path[:, 0], -1.0, atol=0.05)
+            & np.isclose(path[:, 1], -1.0, atol=0.05)
+        )
         path = path[valid_t]
         if len(path) == 0:
             return None
-    return path
+    path = path[np.isfinite(path).all(axis=1)]
+    return path if len(path) > 0 else None
 
 
-def vis_compute_limits(map_xy, map_mask, traj_list, agent_indices, timestep_mask, pad):
+def vis_compute_limits(map_xy, map_mask, limit_paths, pad):
     points = []
 
     for lane_idx in range(map_xy.shape[0]):
@@ -828,33 +814,37 @@ def vis_compute_limits(map_xy, map_mask, traj_list, agent_indices, timestep_mask
         if valid_len > 1:
             points.append(map_xy[lane_idx, :valid_len, :2])
 
-    for traj_xy in traj_list:
-        for agent_idx in agent_indices:
-            path = vis_valid_path(traj_xy, agent_idx, timestep_mask)
-            if path is not None and len(path) > 0:
-                points.append(path[:, :2])
+    points.extend(path[:, :2] for path in limit_paths if path is not None and len(path) > 0)
+    points.append(np.array([[-1.0, -1.0], [1.0, 1.0]], dtype=np.float32))
 
     if not points:
-        return (-50.0, 50.0), (-50.0, 50.0)
+        return (-1.1, 1.1), (-1.1, 1.1)
 
     pts = np.concatenate(points, axis=0)
+    pts = pts[np.isfinite(pts).all(axis=1)]
+    if len(pts) == 0:
+        return (-1.1, 1.1), (-1.1, 1.1)
     x_min, y_min = pts.min(axis=0)
     x_max, y_max = pts.max(axis=0)
-    center_x = 0.5 * (x_min + x_max)
-    center_y = 0.5 * (y_min + y_max)
-    radius = max(x_max - x_min, y_max - y_min) * 0.5 + pad
-    radius = max(radius, 20.0)
-    return (center_x - radius, center_x + radius), (center_y - radius, center_y + radius)
+    span = np.maximum(np.array([x_max - x_min, y_max - y_min]), 0.25)
+    pad_ratio = float(pad)
+    if pad_ratio < 0.0 or pad_ratio >= 1.0:
+        pad_ratio = 0.08
+    pad_xy = span * pad_ratio
+    return (float(x_min - pad_xy[0]), float(x_max + pad_xy[0])), (
+        float(y_min - pad_xy[1]),
+        float(y_max + pad_xy[1]),
+    )
 
 
-def vis_draw_map(ax, map_data, map_xy, map_mask):
+def vis_draw_map(ax, map_data, map_xy, map_mask, map_type):
     for lane_idx in range(map_xy.shape[0]):
         valid_len = int(map_mask[lane_idx].sum())
         if valid_len <= 1:
             continue
         lane = map_xy[lane_idx, :valid_len, :2]
-        lane_type = vis_infer_map_type(map_data, lane_idx, valid_len)
-        style = MAP_STYLE.get(lane_type, MAP_STYLE["unknown"])
+        lane_type = vis_infer_map_type(map_data, map_type, lane_idx, valid_len)
+        style = MAP_STYLE.get(lane_type, {"color": "#9ca3af", "lw": 0.8, "alpha": 0.6, "label": "map"})
         ax.plot(
             lane[:, 0],
             lane[:, 1],
@@ -866,70 +856,147 @@ def vis_draw_map(ax, map_data, map_xy, map_mask):
         )
 
 
-def vis_draw_traj(ax, traj_xy, agent_indices, timestep_mask, agent_types, color_alpha=0.95):
+def vis_draw_paths(ax, traj_xy, agent_indices, timestep_mask, color, label, linestyle="-", linewidth=2.0, alpha=0.95):
+    first_line = None
     for agent_idx in agent_indices:
         path = vis_valid_path(traj_xy, agent_idx, timestep_mask)
-        if path is None or path.shape[0] == 0:
+        if path is None or path.shape[0] < 2:
             continue
+        line = ax.plot(
+            path[:, 0],
+            path[:, 1],
+            color=color,
+            linewidth=linewidth,
+            alpha=alpha,
+            linestyle=linestyle,
+            zorder=4,
+            solid_capstyle="round",
+        )[0]
+        first_line = first_line or line
+        ax.scatter(
+            path[0, 0],
+            path[0, 1],
+            s=16,
+            color=color,
+            edgecolor="white",
+            linewidth=0.5,
+            zorder=5,
+        )
+        ax.scatter(
+            path[-1, 0],
+            path[-1, 1],
+            s=26,
+            marker="x",
+            color=color,
+            linewidth=1.2,
+            zorder=5,
+        )
+    if first_line is not None:
+        first_line.set_label(label)
+    return first_line
 
-        agent_type = int(agent_types[agent_idx]) if agent_types is not None and agent_idx < len(agent_types) else 0
-        color = AGENT_TYPE_COLORS.get(agent_type, "#2060ff")
-        ax.plot(path[:, 0], path[:, 1], color=color, linewidth=2.1, alpha=color_alpha, zorder=5)
-        ax.scatter(path[0, 0], path[0, 1], color=color, s=18, marker="o", zorder=6, edgecolors="white", linewidths=0.4)
-        ax.scatter(path[-1, 0], path[-1, 1], color=color, s=34, marker="*", zorder=7, edgecolors="white", linewidths=0.4)
-        if path.shape[0] >= 2:
-            ax.annotate(
-                "",
-                xy=path[-1, :2],
-                xytext=path[-2, :2],
-                arrowprops=dict(arrowstyle="->", color=color, lw=1.2, alpha=color_alpha),
-                zorder=8,
-            )
+
+def vis_history_mask(history_data):
+    if history_data is None:
+        return None
+    return ~np.isclose(history_data[:, :5], -1.0, atol=0.05).all(axis=1)
 
 
-def scene_position_scale(scene_stats, args):
-    if scene_stats is not None and len(scene_stats) >= 3 and np.isfinite(scene_stats[2]) and scene_stats[2] > 0:
-        return float(scene_stats[2])
-    return float(args.vis_position_scale)
+def vis_setup_axis(ax, map_data, map_xy, map_mask, map_type, xlim, ylim):
+    from matplotlib.patches import Rectangle
+
+    ax.set_facecolor("#ffffff")
+    vis_draw_map(ax, map_data, map_xy, map_mask, map_type)
+    ax.add_patch(
+        Rectangle(
+            (-1.0, -1.0),
+            2.0,
+            2.0,
+            fill=False,
+            linestyle="--",
+            linewidth=1.0,
+            edgecolor="#ef4444",
+            alpha=0.75,
+            zorder=2,
+        )
+    )
+    ax.axhline(0.0, color="#d1d5db", linewidth=0.7, zorder=0)
+    ax.axvline(0.0, color="#d1d5db", linewidth=0.7, zorder=0)
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
+    ax.set_xlabel("normalized x")
+    ax.set_ylabel("normalized y")
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, color="#e5e7eb", linewidth=0.6)
 
 
-def save_single_visualization(image_path, title, pred_xy, gt_xy, map_data, map_mask, map_name, agent_types, target_vehicle_mask, timestep_mask, scene_stats, args):
+def save_single_visualization(image_path, title, pred_xy, gt_xy, history_xy, map_data, map_mask, map_type, map_name, target_vehicle_mask, timestep_mask, history_timestep_mask, args):
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
 
-    position_scale = scene_position_scale(scene_stats, args)
-    map_xy = vis_denormalize_map_xy(map_data, position_scale)
-    pred_xy = vis_denormalize_traj_xy(pred_xy, position_scale)
-    gt_xy = vis_denormalize_traj_xy(gt_xy, position_scale) if gt_xy is not None else None
+    map_xy = map_data[..., :2].copy()
+    pred_xy = vis_traj_xy(pred_xy)
+    gt_xy = vis_traj_xy(gt_xy) if gt_xy is not None else None
+    history_xy = vis_traj_xy(history_xy) if history_xy is not None else None
 
     agent_indices = np.where(target_vehicle_mask.astype(bool))[0]
-    traj_list = [pred_xy]
-    if gt_xy is not None:
-        traj_list.append(gt_xy)
-    xlim, ylim = vis_compute_limits(map_xy, map_mask, traj_list, agent_indices, timestep_mask, args.vis_pad)
+    limit_paths = []
+    for agent_idx in agent_indices:
+        if history_xy is not None:
+            limit_paths.append(vis_valid_path(history_xy, agent_idx, history_timestep_mask))
+        if gt_xy is not None:
+            limit_paths.append(vis_valid_path(gt_xy, agent_idx, timestep_mask))
+    xlim, ylim = vis_compute_limits(map_xy, map_mask, limit_paths, args.vis_pad)
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
-    fig.patch.set_facecolor("#f5f1e7")
+    fig, axes = plt.subplots(1, 2, figsize=(15, 7.5))
+    fig.patch.set_facecolor("#ffffff")
     panels = [
-        (axes[0], "Ground Truth", gt_xy),
-        (axes[1], title, pred_xy),
+        (axes[0], "Ground Truth Future", gt_xy, "#2563eb"),
+        (axes[1], title, pred_xy, "#ea580c"),
     ]
 
-    for ax, panel_title, traj_xy in panels:
-        ax.set_facecolor("#fbfaf6")
-        vis_draw_map(ax, map_data, map_xy, map_mask)
+    for ax, panel_title, traj_xy, future_color in panels:
+        vis_setup_axis(ax, map_data, map_xy, map_mask, map_type, xlim, ylim)
+        handles = [
+            Line2D([0], [0], color=style["color"], linewidth=style["lw"], alpha=style["alpha"], label=style["label"])
+            for style in MAP_STYLE.values()
+        ] + [
+            Line2D([0], [0], color="#ef4444", linestyle="--", linewidth=1.0, label="[-1, 1] box"),
+        ]
+        if history_xy is not None:
+            handle = vis_draw_paths(
+                ax,
+                history_xy,
+                agent_indices,
+                history_timestep_mask,
+                color="#64748b",
+                label="history",
+                linestyle="-",
+                linewidth=1.8,
+                alpha=0.9,
+            )
+            if handle is not None:
+                handles.append(Line2D([0], [0], color="#64748b", linewidth=1.8, label="history"))
         if traj_xy is not None:
-            vis_draw_traj(ax, traj_xy, agent_indices, timestep_mask, agent_types)
+            handle = vis_draw_paths(
+                ax,
+                traj_xy,
+                agent_indices,
+                timestep_mask,
+                color=future_color,
+                label="future",
+                linestyle="-",
+                linewidth=2.2,
+                alpha=0.95,
+            )
+            if handle is not None:
+                handles.append(Line2D([0], [0], color=future_color, linewidth=2.2, label="future"))
         ax.set_title(f"{panel_title} | {map_name}")
-        ax.set_aspect("equal")
-        ax.set_xlim(*xlim)
-        ax.set_ylim(*ylim)
-        ax.grid(alpha=0.12, linestyle="--", linewidth=0.5)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
+        ax.legend(handles=handles, loc="upper right", fontsize=8, frameon=True)
 
     fig.tight_layout()
     image_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(image_path, dpi=args.vis_dpi, bbox_inches="tight")
+    fig.savefig(image_path, dpi=args.vis_dpi)
     plt.close(fig)
 
 
@@ -939,13 +1006,13 @@ def save_sample_visualizations(
     conditional_samples,
     unconditional_samples,
     gt,
+    history_data,
     map_data,
     map_mask,
+    map_type,
     map_name,
-    agent_types,
     target_vehicle_mask,
     timestep_mask,
-    scene_stats,
     args,
 ):
     image_dir = out_dir / f"{step + 1:06d}_images"
@@ -965,13 +1032,14 @@ def save_sample_visualizations(
                 title=f"Conditional | mode {mode_idx}",
                 pred_xy=conditional_samples[mode_idx, scene_idx],
                 gt_xy=gt[scene_idx],
+                history_xy=history_data[scene_idx] if history_data is not None else None,
                 map_data=map_data[scene_idx],
                 map_mask=map_mask[scene_idx],
+                map_type=map_type[scene_idx] if map_type is not None else None,
                 map_name=scene_name,
-                agent_types=agent_types[scene_idx],
                 target_vehicle_mask=target_vehicle_mask[scene_idx],
                 timestep_mask=timestep_mask[scene_idx],
-                scene_stats=scene_stats[scene_idx] if scene_stats is not None else None,
+                history_timestep_mask=vis_history_mask(history_data[scene_idx:scene_idx + 1])[0] if history_data is not None else None,
                 args=args,
             )
             save_single_visualization(
@@ -979,13 +1047,14 @@ def save_sample_visualizations(
                 title=f"Unconditional | mode {mode_idx}",
                 pred_xy=unconditional_samples[mode_idx, scene_idx],
                 gt_xy=gt[scene_idx],
+                history_xy=history_data[scene_idx] if history_data is not None else None,
                 map_data=map_data[scene_idx],
                 map_mask=map_mask[scene_idx],
+                map_type=map_type[scene_idx] if map_type is not None else None,
                 map_name=scene_name,
-                agent_types=agent_types[scene_idx],
                 target_vehicle_mask=target_vehicle_mask[scene_idx],
                 timestep_mask=timestep_mask[scene_idx],
-                scene_stats=scene_stats[scene_idx] if scene_stats is not None else None,
+                history_timestep_mask=vis_history_mask(history_data[scene_idx:scene_idx + 1])[0] if history_data is not None else None,
                 args=args,
             )
 
@@ -1377,7 +1446,7 @@ def main():
     parser.add_argument("--vis_num_modes", default=2, type=int, help="number of modes per scene to visualize")
     parser.add_argument("--vis_position_scale", default=50.0, type=float,
                         help="position scale used to denormalize x/y for visualization")
-    parser.add_argument("--vis_pad", default=10.0, type=float, help="extra padding in visualization limits")
+    parser.add_argument("--vis_pad", default=0.08, type=float, help="fractional padding in normalized visualization limits")
     parser.add_argument("--vis_dpi", default=180, type=int, help="dpi for saved visualization images")
     parser.add_argument("--load_model_path", default="", type=str, help="optional model checkpoint path")
     parser.add_argument("--load_optim_path", default="", type=str, help="optional optimizer checkpoint path")

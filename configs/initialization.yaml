@@ -45,7 +45,7 @@ save_sample_images: false
 vis_num_scenes: 4
 vis_num_modes: 1
 vis_position_scale: 50.0
-vis_pad: 10.0
+vis_pad: 0.08
 vis_dpi: 180
 
 load_model_path: ""
