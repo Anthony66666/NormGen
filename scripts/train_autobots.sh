@@ -15,6 +15,7 @@ AUTOBOTS_DATASET_DIR="${AUTOBOTS_DATASET_DIR:-autobots_data/normgen_generated}"
 AUTOBOTS_SAVE_DIR="${AUTOBOTS_SAVE_DIR:-$ROOT_DIR/autobots_runs}"
 EXP_ID="${EXP_ID:-normgen}"
 USE_MAP_LANES="${USE_MAP_LANES:-0}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 
 if [[ "$AUTOBOTS_DATASET_DIR" = /* ]]; then
   AUTOBOTS_DATASET_PATH="$AUTOBOTS_DATASET_DIR"
@@ -42,7 +43,7 @@ fi
 mkdir -p "$AUTOBOTS_SAVE_DIR"
 
 cd "$AUTOBOTS_ROOT"
-python train.py \
+"$PYTHON_BIN" train.py \
   --exp-id "$EXP_ID" \
   --dataset interaction-dataset \
   --model-type Autobot-Joint \

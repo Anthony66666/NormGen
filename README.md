@@ -13,6 +13,7 @@ The dataset is intentionally not included in this repository.
 - `scripts/train.sh`: one-command training wrapper.
 - `scripts/preprocess.sh`: preprocessing wrapper.
 - `scripts/prepare_autobots_dataset.sh`: convert NormGen NPZ output to AutoBots HDF5.
+- `scripts/prepare_autobots_experiment.sh`: build an AutoBots train/val root from generated train data and optional real validation data.
 - `scripts/smoke_autobots_pipeline.sh`: quick server check for the NormGen-to-AutoBots pipeline.
 - `scripts/train_autobots.sh`: train AutoBots on the converted HDF5 dataset.
 - `scripts/eval_autobots.sh`: evaluate an AutoBots checkpoint.
@@ -173,6 +174,7 @@ cp .env.example .env
 ```
 
 Edit `.env` so `COMBINED_PATH`, `INTERACTION_ROOT`, `AUTOBOTS_ROOT`, `INTERACTION_MAPS_ROOT`, and `NORMGEN_NPZ` point to your server paths. The repo does not include datasets.
+If the command `python` does not point to the intended conda environment, set `PYTHON_BIN=/path/to/env/bin/python` in `.env`.
 
 Run NormGen training:
 
@@ -193,6 +195,15 @@ bash scripts/smoke_autobots_pipeline.sh
 ```
 
 The smoke script writes temporary output under `server_workspace/` by default, not `/tmp`.
+
+For paper-style AutoBots experiments, prepare generated training data with a real validation split:
+
+```bash
+AUTOBOTS_DATASET_DIR=autobots_data/prediction_generated_train_real_val \
+NORMGEN_TRAIN_NPZ=/path/to/prediction_samples.npz \
+REAL_VAL_NPZ=/path/to/real_val_interaction_multi_combined.npz \
+bash scripts/prepare_autobots_experiment.sh
+```
 
 ## AutoBots Pipeline
 
@@ -281,6 +292,35 @@ bash scripts/smoke_autobots_pipeline.sh /path/to/000001_interaction_combined_sam
 If the smoke check reports missing modules such as `pyproj` or `cv2`, install `requirements-autobots.txt` in the AutoBots environment.
 
 ### 3. Train AutoBots on NormGen Data
+
+For strict evaluation, prefer this command because it uses generated data for train and real data for validation:
+
+```bash
+AUTOBOTS_DATASET_DIR=autobots_data/prediction_generated_train_real_val \
+NORMGEN_TRAIN_NPZ=/path/to/prediction_samples.npz \
+REAL_VAL_NPZ=/path/to/real_val_interaction_multi_combined.npz \
+bash scripts/prepare_autobots_experiment.sh
+```
+
+For initialization-mode generated samples, only change `NORMGEN_TRAIN_NPZ`:
+
+```bash
+AUTOBOTS_DATASET_DIR=autobots_data/init_generated_train_real_val \
+NORMGEN_TRAIN_NPZ=/path/to/initialization_samples.npz \
+REAL_VAL_NPZ=/path/to/real_val_interaction_multi_combined.npz \
+bash scripts/prepare_autobots_experiment.sh
+```
+
+The script creates:
+
+```text
+AUTOBOTS_DATASET_DIR/
+  train_dataset.hdf5   # generated prediction/init samples
+  val_dataset.hdf5     # real combined validation, if REAL_VAL_NPZ is set
+  maps/*.osm
+```
+
+If `REAL_VAL_NPZ` is not set, it splits the generated data into train/val. Use that only for debugging or smoke tests, not for final paper numbers.
 
 ```bash
 AUTOBOTS_ROOT=../AutoBots \

@@ -10,6 +10,7 @@ if [[ -f .env ]]; then
   set +a
 fi
 
+PYTHON_BIN="${PYTHON_BIN:-python}"
 INPUT_NPZ="${1:-${NORMGEN_NPZ:-}}"
 if [[ $# -gt 0 && "${1:0:1}" != "-" ]]; then
   shift
@@ -34,7 +35,7 @@ else
   MAP_ARGS+=(--map-copy-mode dummy --allow-dummy-maps)
 fi
 
-python tools/convert_normgen_to_autobots.py \
+"$PYTHON_BIN" tools/convert_normgen_to_autobots.py \
   --input-npz "$INPUT_NPZ" \
   --output-dir "$AUTOBOTS_DATASET_DIR" \
   --sample-key "$SAMPLE_KEY" \

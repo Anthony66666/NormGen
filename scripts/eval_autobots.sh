@@ -17,6 +17,7 @@ fi
 
 AUTOBOTS_ROOT="${AUTOBOTS_ROOT:-../AutoBots}"
 AUTOBOTS_DATASET_DIR="${AUTOBOTS_DATASET_DIR:-autobots_data/normgen_generated}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 
 if [[ "$AUTOBOTS_DATASET_DIR" = /* ]]; then
   AUTOBOTS_DATASET_PATH="$AUTOBOTS_DATASET_DIR"
@@ -41,7 +42,7 @@ if [[ ! -f "$AUTOBOTS_DATASET_PATH/val_dataset.hdf5" ]]; then
 fi
 
 cd "$AUTOBOTS_ROOT"
-python evaluate.py \
+"$PYTHON_BIN" evaluate.py \
   --models-path "$MODEL_PATH" \
   --dataset-path "$AUTOBOTS_DATASET_PATH" \
   --batch-size "${AUTOBOTS_EVAL_BATCH_SIZE:-16}" \

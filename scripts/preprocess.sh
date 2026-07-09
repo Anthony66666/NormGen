@@ -13,6 +13,7 @@ fi
 INTERACTION_ROOT="${INTERACTION_ROOT:-}"
 SPLIT="${SPLIT:-train}"
 OUTPUT_DIR="${OUTPUT_DIR:-data/processed_${SPLIT}}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 
 if [[ $# -gt 0 && "${1:0:1}" != "-" ]]; then
   INTERACTION_ROOT="$1"
@@ -27,7 +28,7 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 
-python data_preprocess.py \
+"$PYTHON_BIN" data_preprocess.py \
   --root "$INTERACTION_ROOT" \
   --split "$SPLIT" \
   --output_dir "$OUTPUT_DIR" \
