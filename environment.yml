@@ -1,0 +1,17 @@
+name: normgen
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+  - pytorch=2.4
+  - pytorch-cuda=11.8
+  - numpy=1.26
+  - pandas=2.2
+  - pyyaml=6.0
+  - tqdm=4.66
+  - matplotlib
+  - tensorboard
