@@ -4,7 +4,6 @@
 import argparse
 import os
 import shutil
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import h5py
@@ -17,8 +16,12 @@ def parse_args():
     )
     parser.add_argument("--input-npz", required=True, help="NormGen combined dataset or sample NPZ.")
     parser.add_argument("--output-dir", required=True, help="Output dataset root for AutoBots.")
-    parser.add_argument("--source", default="auto", choices=["auto", "combined", "samples"])
-                        # fmt: skip
+    parser.add_argument(
+        "--source",
+        default="auto",
+        choices=["auto", "combined", "samples"],
+        help="Input NPZ format. auto detects combined preprocessing files vs generated sample files.",
+    )
     parser.add_argument(
         "--sample-key",
         default="conditional_samples",
@@ -169,7 +172,7 @@ def build_dummy_osm(path):
   <way id='1'>
     <nd ref='1' />
     <nd ref='2' />
-    <tag k='type' v='virtual' />
+    <tag k='type' v='road_border' />
   </way>
 </osm>
 """,

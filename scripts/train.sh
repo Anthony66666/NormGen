@@ -13,6 +13,8 @@ fi
 MODE="${MODE:-prediction}"
 CONFIG="${CONFIG:-configs/${MODE}.yaml}"
 COMBINED_PATH="${COMBINED_PATH:-data/interaction_multi_train_combined.npz}"
+NUM_GPUS="${NUM_GPUS:-}"
+LAUNCHER="${LAUNCHER:-auto}"
 
 if [[ $# -gt 0 && "${1:0:1}" != "-" ]]; then
   COMBINED_PATH="$1"
@@ -32,7 +34,16 @@ fi
 
 mkdir -p results runs
 
-python train_combined.py \
-  --config "$CONFIG" \
-  --combined_path "$COMBINED_PATH" \
-  "$@"
+if [[ -n "$NUM_GPUS" && "$NUM_GPUS" != "0" && "$NUM_GPUS" != "1" ]]; then
+  torchrun --standalone --nproc_per_node "$NUM_GPUS" train_combined.py \
+    --launcher torchrun \
+    --config "$CONFIG" \
+    --combined_path "$COMBINED_PATH" \
+    "$@"
+else
+  python train_combined.py \
+    --launcher "$LAUNCHER" \
+    --config "$CONFIG" \
+    --combined_path "$COMBINED_PATH" \
+    "$@"
+fi

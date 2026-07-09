@@ -16,14 +16,20 @@ AUTOBOTS_SAVE_DIR="${AUTOBOTS_SAVE_DIR:-$ROOT_DIR/autobots_runs}"
 EXP_ID="${EXP_ID:-normgen}"
 USE_MAP_LANES="${USE_MAP_LANES:-0}"
 
+if [[ "$AUTOBOTS_DATASET_DIR" = /* ]]; then
+  AUTOBOTS_DATASET_PATH="$AUTOBOTS_DATASET_DIR"
+else
+  AUTOBOTS_DATASET_PATH="$ROOT_DIR/$AUTOBOTS_DATASET_DIR"
+fi
+
 if [[ ! -d "$AUTOBOTS_ROOT" ]]; then
   echo "Missing AutoBots repo: $AUTOBOTS_ROOT" >&2
   echo "Set AUTOBOTS_ROOT in .env." >&2
   exit 1
 fi
 
-if [[ ! -f "$AUTOBOTS_DATASET_DIR/train_dataset.hdf5" || ! -f "$AUTOBOTS_DATASET_DIR/val_dataset.hdf5" ]]; then
-  echo "Missing AutoBots train/val HDF5 files under $AUTOBOTS_DATASET_DIR." >&2
+if [[ ! -f "$AUTOBOTS_DATASET_PATH/train_dataset.hdf5" || ! -f "$AUTOBOTS_DATASET_PATH/val_dataset.hdf5" ]]; then
+  echo "Missing AutoBots train/val HDF5 files under $AUTOBOTS_DATASET_PATH." >&2
   echo "Run scripts/prepare_autobots_dataset.sh first." >&2
   exit 1
 fi
@@ -40,7 +46,7 @@ python train.py \
   --exp-id "$EXP_ID" \
   --dataset interaction-dataset \
   --model-type Autobot-Joint \
-  --dataset-path "$ROOT_DIR/$AUTOBOTS_DATASET_DIR" \
+  --dataset-path "$AUTOBOTS_DATASET_PATH" \
   --save-dir "$AUTOBOTS_SAVE_DIR" \
   --num-modes "${AUTOBOTS_NUM_MODES:-6}" \
   --hidden-size "${AUTOBOTS_HIDDEN_SIZE:-128}" \

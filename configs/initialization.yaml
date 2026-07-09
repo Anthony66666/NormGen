@@ -28,6 +28,9 @@ cfg_scale: 1.0
 n_modes: 6
 
 num_workers: 4
+worker_start_method: ""
+persistent_workers: true
+prefetch_factor: 2
 sample_interval: 2000
 save_interval: 2000
 
@@ -44,6 +47,20 @@ vis_dpi: 180
 load_model_path: ""
 load_optim_path: ""
 loadckpt: false
+resume_path: ""
+resume_model_only: false
+no_resume_iter: false
+save_step_checkpoints: false
+keep_legacy_checkpoints: true
+loss_normalize: scene
 
 amp: true
 compile: false
+seed: 42
+deterministic: false
+devices: -1
+launcher: auto
+master_addr: 127.0.0.1
+master_port: "12349"
+dist_backend: ""
+ddp_find_unused_parameters: true

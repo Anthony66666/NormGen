@@ -18,6 +18,12 @@ fi
 AUTOBOTS_ROOT="${AUTOBOTS_ROOT:-../AutoBots}"
 AUTOBOTS_DATASET_DIR="${AUTOBOTS_DATASET_DIR:-autobots_data/normgen_generated}"
 
+if [[ "$AUTOBOTS_DATASET_DIR" = /* ]]; then
+  AUTOBOTS_DATASET_PATH="$AUTOBOTS_DATASET_DIR"
+else
+  AUTOBOTS_DATASET_PATH="$ROOT_DIR/$AUTOBOTS_DATASET_DIR"
+fi
+
 if [[ -z "$MODEL_PATH" || ! -f "$MODEL_PATH" ]]; then
   echo "Missing AutoBots checkpoint." >&2
   echo "Usage: bash scripts/eval_autobots.sh /path/to/best_models_fde.pth [extra eval args]" >&2
@@ -29,14 +35,14 @@ if [[ ! -d "$AUTOBOTS_ROOT" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$AUTOBOTS_DATASET_DIR/val_dataset.hdf5" ]]; then
-  echo "Missing val_dataset.hdf5 under $AUTOBOTS_DATASET_DIR." >&2
+if [[ ! -f "$AUTOBOTS_DATASET_PATH/val_dataset.hdf5" ]]; then
+  echo "Missing val_dataset.hdf5 under $AUTOBOTS_DATASET_PATH." >&2
   exit 1
 fi
 
 cd "$AUTOBOTS_ROOT"
 python evaluate.py \
   --models-path "$MODEL_PATH" \
-  --dataset-path "$ROOT_DIR/$AUTOBOTS_DATASET_DIR" \
+  --dataset-path "$AUTOBOTS_DATASET_PATH" \
   --batch-size "${AUTOBOTS_EVAL_BATCH_SIZE:-16}" \
   "$@"

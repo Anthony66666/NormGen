@@ -12,6 +12,10 @@ The dataset is intentionally not included in this repository.
 - `configs/initialization.yaml`: default full-trajectory initialization training config.
 - `scripts/train.sh`: one-command training wrapper.
 - `scripts/preprocess.sh`: preprocessing wrapper.
+- `scripts/prepare_autobots_dataset.sh`: convert NormGen NPZ output to AutoBots HDF5.
+- `scripts/smoke_autobots_pipeline.sh`: quick server check for the NormGen-to-AutoBots pipeline.
+- `scripts/train_autobots.sh`: train AutoBots on the converted HDF5 dataset.
+- `scripts/eval_autobots.sh`: evaluate an AutoBots checkpoint.
 
 ## Environment
 
@@ -111,6 +115,40 @@ Any extra arguments after the dataset path are passed to `train_combined.py`:
 bash scripts/train.sh /data/interaction_multi_train_combined.npz --batch 4 --iter 100000
 ```
 
+`--batch` is the per-GPU batch size. With 4 GPUs and `--batch 8`, the global
+batch size is 32.
+
+Single-node multi-GPU training:
+
+```bash
+NUM_GPUS=4 bash scripts/train.sh /data/interaction_multi_train_combined.npz
+```
+
+Equivalent explicit `torchrun` command:
+
+```bash
+torchrun --standalone --nproc_per_node 4 train_combined.py \
+  --launcher torchrun \
+  --config configs/prediction.yaml \
+  --combined_path /data/interaction_multi_train_combined.npz
+```
+
+For low-memory servers, start conservatively because every DDP rank loads the
+processed NPZ:
+
+```bash
+NUM_GPUS=4 bash scripts/train.sh /data/interaction_multi_train_combined.npz \
+  --batch 4 \
+  --num_workers 0
+```
+
+Resume from the full training checkpoint:
+
+```bash
+bash scripts/train.sh /data/interaction_multi_train_combined.npz \
+  --resume_path results/last.pt
+```
+
 To save visualization PNGs during sampling:
 
 ```bash
@@ -119,9 +157,42 @@ bash scripts/train.sh /data/interaction_multi_train_combined.npz --save_sample_i
 
 Outputs:
 
-- checkpoints: `results/model_interaction_combined.pt`, `results/optim_interaction_combined.pt`
+- full checkpoint: `results/last.pt`
+- legacy checkpoints: `results/model_interaction_combined.pt`, `results/optim_interaction_combined.pt`
 - samples: `results/*_interaction_combined_samples.npz`
 - TensorBoard logs: `runs/`
+
+## Server Quick Start
+
+After pulling this repository on the server:
+
+```bash
+conda env create -f environment.yml
+conda activate normgen
+cp .env.example .env
+```
+
+Edit `.env` so `COMBINED_PATH`, `INTERACTION_ROOT`, `AUTOBOTS_ROOT`, `INTERACTION_MAPS_ROOT`, and `NORMGEN_NPZ` point to your server paths. The repo does not include datasets.
+
+Run NormGen training:
+
+```bash
+bash scripts/train.sh
+```
+
+For the AutoBots pipeline, install the extra dependencies in the environment used to run AutoBots:
+
+```bash
+pip install -r requirements-autobots.txt
+```
+
+Then run the smoke check before starting a long AutoBots job:
+
+```bash
+bash scripts/smoke_autobots_pipeline.sh
+```
+
+The smoke script writes temporary output under `server_workspace/` by default, not `/tmp`.
 
 ## AutoBots Pipeline
 
@@ -200,6 +271,14 @@ autobots_data/normgen_generated/
 ```
 
 If `INTERACTION_MAPS_ROOT` is not set, the converter writes minimal dummy maps. That is enough for `USE_MAP_LANES=0`; for map-lane experiments, use the real INTERACTION maps.
+
+Before a long run, check the converted format and AutoBots loader:
+
+```bash
+bash scripts/smoke_autobots_pipeline.sh /path/to/000001_interaction_combined_samples.npz
+```
+
+If the smoke check reports missing modules such as `pyproj` or `cv2`, install `requirements-autobots.txt` in the AutoBots environment.
 
 ### 3. Train AutoBots on NormGen Data
 

@@ -5,6 +5,7 @@ import argparse
 import io
 import os
 import pickle
+import random
 import struct
 import time
 import zipfile
@@ -21,7 +22,17 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.optim.lr_scheduler import StepLR
-from torch.amp import autocast, GradScaler
+
+try:
+    from torch.amp import autocast as _autocast
+    from torch.amp import GradScaler as _GradScaler
+
+    _AMP_REQUIRES_DEVICE_TYPE = True
+except ImportError:
+    from torch.cuda.amp import autocast as _autocast
+    from torch.cuda.amp import GradScaler as _GradScaler
+
+    _AMP_REQUIRES_DEVICE_TYPE = False
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -108,6 +119,128 @@ def infer_target_labels(target_data, target_vehicle_mask, turn_angle_threshold_d
 
 def uses_label_condition(train_mode):
     return train_mode == "initialization"
+
+
+def make_grad_scaler(enabled):
+    if _AMP_REQUIRES_DEVICE_TYPE:
+        return _GradScaler("cuda", enabled=enabled)
+    return _GradScaler(enabled=enabled)
+
+
+def cuda_autocast(enabled):
+    if _AMP_REQUIRES_DEVICE_TYPE:
+        return _autocast("cuda", enabled=enabled)
+    return _autocast(enabled=enabled)
+
+
+def get_env_int(name, default=None):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def set_random_seed(seed, rank=0):
+    if seed is None or seed < 0:
+        return
+    seed = int(seed) + int(rank)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def unwrap_model(model):
+    model = getattr(model, "module", model)
+    return getattr(model, "_orig_mod", model)
+
+
+def normalize_state_dict_keys(state_dict):
+    if not isinstance(state_dict, dict):
+        return state_dict
+    prefixes = ("module.", "_orig_mod.")
+    normalized = state_dict
+    for prefix in prefixes:
+        if normalized and all(isinstance(k, str) and k.startswith(prefix) for k in normalized.keys()):
+            normalized = {k[len(prefix):]: v for k, v in normalized.items()}
+    return normalized
+
+
+def torch_load_checkpoint(path, map_location="cpu", weights_only=False):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=weights_only)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def save_training_checkpoint(path, model, optimizer, scheduler, scaler, args, step):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "format_version": 2,
+        "step": int(step),
+        "next_iter": int(step) + 1,
+        "model_state": unwrap_model(model).state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+        "scaler_state": scaler.state_dict() if scaler is not None else None,
+        "args": vars(args).copy(),
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+    torch.save(payload, path)
+
+
+def load_training_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None, load_optimizer=True):
+    if not path:
+        return None
+    if not os.path.exists(path):
+        print(f"[checkpoint] missing file: {path}")
+        return None
+
+    ckpt = torch_load_checkpoint(path, map_location="cpu", weights_only=False)
+    if isinstance(ckpt, dict) and "model_state" in ckpt:
+        missing, unexpected = model.load_state_dict(
+            normalize_state_dict_keys(ckpt["model_state"]),
+            strict=False,
+        )
+        print(f"[checkpoint] loaded model: {path}; missing={len(missing)} unexpected={len(unexpected)}")
+        if load_optimizer and optimizer is not None and ckpt.get("optimizer_state") is not None:
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+        if load_optimizer and scheduler is not None and ckpt.get("scheduler_state") is not None:
+            scheduler.load_state_dict(ckpt["scheduler_state"])
+        if load_optimizer and scaler is not None and ckpt.get("scaler_state") is not None:
+            scaler.load_state_dict(ckpt["scaler_state"])
+        return ckpt.get("next_iter")
+
+    missing, unexpected = model.load_state_dict(normalize_state_dict_keys(ckpt), strict=False)
+    print(f"[checkpoint] loaded legacy state dict: {path}; missing={len(missing)} unexpected={len(unexpected)}")
+    return None
+
+
+def distributed_bad_flag(local_bad, is_distributed, device):
+    flag = torch.tensor(int(bool(local_bad)), device=device, dtype=torch.int32)
+    if is_distributed:
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    return bool(flag.item())
+
+
+def distributed_label_condition(train_mode, keep_prob, is_distributed, device):
+    if not uses_label_condition(train_mode):
+        return False
+    keep = torch.rand(1, device=device) < float(keep_prob)
+    if is_distributed:
+        dist.broadcast(keep, src=0)
+    return bool(keep.item())
+
+
+def valid_dimension_count(batch, channels):
+    valid_tv = batch["timestep_mask"].float().sum(dim=(1, 2))
+    return (valid_tv * int(channels)).clamp_min(1.0)
 
 
 class CombinedInteractionDataset(Dataset):
@@ -352,7 +485,7 @@ def safe_load_state(path, map_location="cpu"):
         return None
 
 
-def build_dataloader(args, is_distributed, local_rank, ngpus_per_node):
+def build_dataloader(args, is_distributed, rank, world_size):
     dataset = CombinedInteractionDataset(
         combined_path=args.combined_path,
         in_channel=args.in_channel,
@@ -368,16 +501,20 @@ def build_dataloader(args, is_distributed, local_rank, ngpus_per_node):
     dataloader_kwargs = {
         "num_workers": args.num_workers,
         "pin_memory": torch.cuda.is_available(),
+        "drop_last": is_distributed,
     }
     if args.num_workers > 0:
-        dataloader_kwargs["multiprocessing_context"] = "spawn"
-        dataloader_kwargs["persistent_workers"] = True
+        if args.worker_start_method:
+            dataloader_kwargs["multiprocessing_context"] = args.worker_start_method
+        dataloader_kwargs["persistent_workers"] = bool(args.persistent_workers)
+        if args.prefetch_factor > 0:
+            dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
 
     if is_distributed:
         sampler = DistributedSampler(
             dataset,
-            num_replicas=ngpus_per_node,
-            rank=local_rank,
+            num_replicas=world_size,
+            rank=rank,
             shuffle=True,
             drop_last=True,
         )
@@ -823,9 +960,11 @@ def save_sample_visualizations(
     print(f"[samples] saved images to {image_dir}")
 
 
-def train(gpu, ngpus_per_node, args):
-    is_distributed = ngpus_per_node > 1
-    local_rank = gpu
+def train(local_rank, world_size, args, rank=None):
+    rank = local_rank if rank is None else rank
+    is_distributed = world_size > 1
+    set_random_seed(args.seed, rank=rank)
+
     if torch.cuda.is_available():
         if is_distributed:
             device = torch.device(f"cuda:{local_rank}")
@@ -837,15 +976,15 @@ def train(gpu, ngpus_per_node, args):
 
     if is_distributed:
         dist.init_process_group(
-            backend="nccl" if torch.cuda.is_available() else "gloo",
+            backend=args.dist_backend or ("nccl" if torch.cuda.is_available() else "gloo"),
             init_method="env://",
-            world_size=ngpus_per_node,
-            rank=local_rank,
+            world_size=world_size,
+            rank=rank,
         )
 
-    is_main = (not is_distributed) or local_rank == 0
+    is_main = (not is_distributed) or rank == 0
 
-    dataloader, sampler, dataset = build_dataloader(args, is_distributed, local_rank, ngpus_per_node)
+    dataloader, sampler, dataset = build_dataloader(args, is_distributed, rank, world_size)
     args.label_source = dataset.label_source
 
     if args.img_size_h <= 0:
@@ -877,36 +1016,53 @@ def train(gpu, ngpus_per_node, args):
     scheduler = StepLR(optimizer, step_size=10000, gamma=0.96)
 
     use_amp = args.amp and torch.cuda.is_available()
-    scaler = GradScaler("cuda", enabled=use_amp)
+    scaler = make_grad_scaler(enabled=use_amp)
 
-    if args.compile and hasattr(torch, "compile"):
-        if is_main:
-            print(f"[rank {local_rank}] compiling model with torch.compile")
-        model_single = torch.compile(model_single, mode="reduce-overhead")
-
+    resume_next_iter = None
+    if args.resume_path:
+        resume_next_iter = load_training_checkpoint(
+            args.resume_path,
+            model_single,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            load_optimizer=not args.resume_model_only,
+        )
     if args.loadckpt:
         if args.load_model_path:
             ckpt = safe_load_state(args.load_model_path, map_location="cpu")
             if ckpt is not None:
-                model_single.load_state_dict(ckpt, strict=False)
+                model_single.load_state_dict(normalize_state_dict_keys(ckpt), strict=False)
         if args.load_optim_path:
             opt_state = safe_load_state(args.load_optim_path, map_location="cpu")
             if opt_state is not None:
                 optimizer.load_state_dict(opt_state)
+
+    if args.resume_path and resume_next_iter is not None and not args.no_resume_iter:
+        args.start_iter = int(resume_next_iter)
+        if is_main:
+            print(f"[checkpoint] resume start_iter set to {args.start_iter}")
+
+    if args.compile and hasattr(torch, "compile"):
+        if is_main:
+            print(f"[rank {rank}] compiling model with torch.compile")
+        model_single = torch.compile(model_single, mode="reduce-overhead")
 
     initialize_model_once(
         model_single,
         dataloader,
         device,
         is_distributed=is_distributed,
-        local_rank=local_rank,
+        local_rank=rank,
         sampler=sampler,
         train_mode=args.train_mode,
     )
 
     if is_distributed:
         model = nn.parallel.DistributedDataParallel(
-            model_single, device_ids=[local_rank], find_unused_parameters=True
+            model_single,
+            device_ids=[local_rank] if torch.cuda.is_available() else None,
+            find_unused_parameters=args.ddp_find_unused_parameters,
         )
     else:
         model = model_single
@@ -920,7 +1076,7 @@ def train(gpu, ngpus_per_node, args):
         logdir.mkdir(parents=True, exist_ok=True)
         if SummaryWriter is not None:
             writer = SummaryWriter(log_dir=str(logdir))
-            print(f"[rank {local_rank}] TensorBoard logdir: {logdir}")
+            print(f"[rank {rank}] TensorBoard logdir: {logdir}")
         else:
             print("[tensorboard] tensorboard is not installed; scalar logging disabled")
 
@@ -949,33 +1105,44 @@ def train(gpu, ngpus_per_node, args):
         target_data = batch["target_data"]
         labels = batch["labels"]
         map_data = batch["map_data"]
-        map_mask = batch["map_mask"]
-        agent_types = batch["agent_types"]
 
-        if torch.isnan(map_data).any() or torch.isnan(target_data).any():
+        bad_input = torch.isnan(map_data).any() or torch.isnan(target_data).any()
+        if distributed_bad_flag(bad_input, is_distributed, device):
             if is_main:
-                print(f"[Iter {i}] NaN detected in input tensors, skip batch")
+                print(f"[Iter {i}] NaN detected in input tensors, skip batch on all ranks")
             continue
 
-        use_conditional = uses_label_condition(args.train_mode) and torch.rand(1).item() < args.label_keep_prob
+        use_conditional = distributed_label_condition(
+            args.train_mode,
+            args.label_keep_prob,
+            is_distributed,
+            device,
+        )
         condition_input = labels if use_conditional else None
 
-        with autocast("cuda", enabled=use_amp):
+        with cuda_autocast(enabled=use_amp):
             log_p, logdet, _ = model(
                 target_data,
                 condition=condition_input,
                 **build_model_context_kwargs(batch, train_mode=args.train_mode),
             )
-            loss_value = -(logdet + log_p).mean()
+            nll_per_scene = -(logdet + log_p)
+            valid_dims = valid_dimension_count(batch, args.in_channel)
+            nll_per_valid_dim = nll_per_scene / valid_dims
+            if args.loss_normalize == "valid_dim":
+                loss_value = nll_per_valid_dim.mean()
+            else:
+                loss_value = nll_per_scene.mean()
 
-        if (
+        bad_loss = (
             torch.isnan(loss_value)
             or torch.isinf(loss_value)
             or torch.isnan(log_p).any()
             or torch.isnan(logdet).any()
-        ):
+        )
+        if distributed_bad_flag(bad_loss, is_distributed, device):
             if is_main:
-                print(f"[Iter {i}] NaN/Inf detected, skip batch")
+                print(f"[Iter {i}] NaN/Inf detected, skip batch on all ranks")
             optimizer.zero_grad(set_to_none=True)
             continue
 
@@ -994,14 +1161,18 @@ def train(gpu, ngpus_per_node, args):
         if is_main:
             log_p_mean = log_p.mean()
             logdet_mean = logdet.mean()
+            nll_dim_mean = nll_per_valid_dim.mean()
             progress.set_description(
                 f"Loss: {loss_value.item():.5f}; logP: {log_p_mean.item():.5f}; "
-                f"logdet: {logdet_mean.item():.5f}; lr: {optimizer.param_groups[0]['lr']:.7f}"
+                f"logdet: {logdet_mean.item():.5f}; "
+                f"nll/dim: {nll_dim_mean.item():.5f}; lr: {optimizer.param_groups[0]['lr']:.7f}"
             )
             if writer is not None:
                 writer.add_scalar("train/loss", loss_value.item(), i)
                 writer.add_scalar("train/log_p", log_p_mean.item(), i)
                 writer.add_scalar("train/logdet", logdet_mean.item(), i)
+                writer.add_scalar("train/nll_per_valid_dim", nll_dim_mean.item(), i)
+                writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], i)
 
         if is_main and (i % args.sample_interval == 0 or i == start_iter + 20):
             with torch.no_grad():
@@ -1010,11 +1181,19 @@ def train(gpu, ngpus_per_node, args):
         if is_main and (i % args.save_interval == 0):
             ckpt_dir = Path(args.ckpt_dir)
             ckpt_dir.mkdir(parents=True, exist_ok=True)
+            last_path = ckpt_dir / "last.pt"
+            save_training_checkpoint(last_path, model_single, optimizer, scheduler, scaler, args, i)
+            if args.save_step_checkpoints:
+                step_path = ckpt_dir / f"step_{i + 1:06d}.pt"
+                save_training_checkpoint(step_path, model_single, optimizer, scheduler, scaler, args, i)
+            print(f"[rank {rank}] saved checkpoint: {last_path}")
+
+        if is_main and args.keep_legacy_checkpoints and (i % args.save_interval == 0):
             model_path = ckpt_dir / "model_interaction_combined.pt"
             optim_path = ckpt_dir / "optim_interaction_combined.pt"
-            torch.save(model_single.state_dict(), model_path)
+            torch.save(unwrap_model(model_single).state_dict(), model_path)
             torch.save(optimizer.state_dict(), optim_path)
-            print(f"[rank {local_rank}] saved checkpoint: {model_path}")
+            print(f"[rank {rank}] saved legacy checkpoints: {model_path}, {optim_path}")
 
     if writer is not None:
         writer.close()
@@ -1063,6 +1242,12 @@ def main():
     parser.add_argument("--cfg_scale", default=1.0, type=float, help="CFG scale for label-conditioned sampling")
     parser.add_argument("--n_modes", default=6, type=int, help="number of samples to save per batch")
     parser.add_argument("--num_workers", default=4, type=int, help="dataloader workers")
+    parser.add_argument("--worker_start_method", default="", choices=["", "fork", "spawn", "forkserver"],
+                        help="dataloader multiprocessing context; empty uses PyTorch default")
+    parser.add_argument("--persistent_workers", action=argparse.BooleanOptionalAction, default=True,
+                        help="keep dataloader workers alive when num_workers > 0")
+    parser.add_argument("--prefetch_factor", default=2, type=int,
+                        help="dataloader prefetch factor when num_workers > 0; <=0 disables explicit setting")
     parser.add_argument("--sample_interval", default=2000, type=int, help="sample save interval")
     parser.add_argument("--save_interval", default=2000, type=int, help="checkpoint save interval")
     parser.add_argument("--log_dir", default="./runs", type=str, help="tensorboard log dir")
@@ -1079,8 +1264,32 @@ def main():
     parser.add_argument("--load_model_path", default="", type=str, help="optional model checkpoint path")
     parser.add_argument("--load_optim_path", default="", type=str, help="optional optimizer checkpoint path")
     parser.add_argument("--loadckpt", action="store_true", help="load ckpt before training")
+    parser.add_argument("--resume_path", default="", type=str,
+                        help="full training checkpoint path, e.g. results/last.pt")
+    parser.add_argument("--resume_model_only", action="store_true",
+                        help="with --resume_path, load model weights but not optimizer/scheduler/scaler")
+    parser.add_argument("--no_resume_iter", action="store_true",
+                        help="with --resume_path, keep CLI/config start_iter instead of checkpoint next_iter")
+    parser.add_argument("--save_step_checkpoints", action=argparse.BooleanOptionalAction, default=False,
+                        help="also save numbered step_*.pt checkpoints")
+    parser.add_argument("--keep_legacy_checkpoints", action=argparse.BooleanOptionalAction, default=True,
+                        help="also save model_interaction_combined.pt and optim_interaction_combined.pt")
+    parser.add_argument("--loss_normalize", default="scene", choices=["scene", "valid_dim"],
+                        help="scene keeps original summed scene NLL; valid_dim averages by valid target dimensions")
     parser.add_argument("--amp", action="store_true", help="enable automatic mixed precision")
     parser.add_argument("--compile", action="store_true", help="enable torch.compile when available")
+    parser.add_argument("--seed", default=42, type=int, help="base random seed; negative disables seeding")
+    parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=False,
+                        help="enable deterministic algorithms where PyTorch supports them")
+    parser.add_argument("--devices", default=-1, type=int,
+                        help="number of local CUDA devices for spawn launcher; -1 uses all visible GPUs")
+    parser.add_argument("--launcher", default="auto", choices=["auto", "spawn", "torchrun", "none"],
+                        help="distributed launcher mode")
+    parser.add_argument("--master_addr", default="127.0.0.1", type=str, help="MASTER_ADDR for spawn launcher")
+    parser.add_argument("--master_port", default="12349", type=str, help="MASTER_PORT for spawn launcher")
+    parser.add_argument("--dist_backend", default="", type=str, help="override distributed backend")
+    parser.add_argument("--ddp_find_unused_parameters", action=argparse.BooleanOptionalAction, default=True,
+                        help="DDP find_unused_parameters; keep true because label conditioning can disable branches")
 
     config_probe_args, _ = parser.parse_known_args()
     if config_probe_args.config:
@@ -1101,6 +1310,10 @@ def main():
     args.use_history = args.train_mode == "prediction"
     if not 0.0 <= args.label_keep_prob <= 1.0:
         raise ValueError(f"label_keep_prob must be in [0, 1], got {args.label_keep_prob}")
+    if args.num_workers == 0 and not args.persistent_workers:
+        args.persistent_workers = False
+    if args.deterministic:
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
     target_steps_for_mode = (
         args.prediction_target_steps
@@ -1117,19 +1330,42 @@ def main():
     for key, value in vars(args).items():
         print(f"  {key}: {value}")
 
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "12349")
+    torchrun_world_size = get_env_int("WORLD_SIZE", 1)
+    torchrun_rank = get_env_int("RANK", 0)
+    torchrun_local_rank = get_env_int("LOCAL_RANK", 0)
+    use_torchrun = args.launcher == "torchrun" or (
+        args.launcher == "auto" and torchrun_world_size is not None and torchrun_world_size > 1
+    )
 
-    ngpus_per_node = torch.cuda.device_count()
-    if ngpus_per_node == 0:
+    visible_gpus = torch.cuda.device_count()
+    if use_torchrun:
+        print(
+            f"Detected torchrun environment: rank={torchrun_rank}, "
+            f"local_rank={torchrun_local_rank}, world_size={torchrun_world_size}"
+        )
+        train(torchrun_local_rank, torchrun_world_size, args, rank=torchrun_rank)
+        return
+
+    if args.launcher == "none":
+        print("Launcher disabled, running single process.")
+        train(0, 1, args, rank=0)
+        return
+
+    os.environ.setdefault("MASTER_ADDR", args.master_addr)
+    os.environ.setdefault("MASTER_PORT", args.master_port)
+
+    requested_gpus = visible_gpus if args.devices is None or args.devices < 0 else args.devices
+    if visible_gpus == 0 or requested_gpus == 0:
         print("No GPU detected, run in single-process CPU mode.")
-        train(0, 1, args)
-    elif ngpus_per_node == 1:
+        train(0, 1, args, rank=0)
+    elif requested_gpus == 1:
         print("Detected 1 GPU, run in single-process CUDA mode.")
-        train(0, 1, args)
+        train(0, 1, args, rank=0)
     else:
-        print(f"Detected {ngpus_per_node} GPUs, launching DDP with mp.spawn")
-        mp.spawn(train, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
+        if requested_gpus > visible_gpus:
+            raise ValueError(f"requested devices={requested_gpus}, but only {visible_gpus} CUDA devices are visible")
+        print(f"Detected {visible_gpus} GPUs, launching DDP on {requested_gpus} GPUs with mp.spawn")
+        mp.spawn(train, nprocs=requested_gpus, args=(requested_gpus, args))
 
 
 if __name__ == "__main__":

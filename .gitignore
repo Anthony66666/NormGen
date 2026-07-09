@@ -13,6 +13,8 @@ data/
 results/
 runs/
 checkpoints/
+autobots_runs/
+autobots_data/
 
 .env
 .vscode/
