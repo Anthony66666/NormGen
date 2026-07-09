@@ -749,7 +749,7 @@ def save_samples_npz(model_single, batch, args, z_shapes, device, step):
         save_sample_visualizations(
             out_dir=out_dir,
             step=step,
-            prediction_samples=conditional_samples,
+            prediction_samples=unconditional_samples,
             gt=np.array(sample_gt.cpu().data),
             history_data=(
                 np.array(sample_batch["history_data"].cpu().data)
