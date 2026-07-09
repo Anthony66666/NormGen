@@ -229,6 +229,16 @@ def distributed_bad_flag(local_bad, is_distributed, device):
     return bool(flag.item())
 
 
+def broadcast_tensor_from_rank0_(tensor):
+    if tensor.is_contiguous():
+        dist.broadcast(tensor, src=0)
+        return
+
+    synced = tensor.contiguous()
+    dist.broadcast(synced, src=0)
+    tensor.copy_(synced)
+
+
 def distributed_label_condition(train_mode, keep_prob, is_distributed, device):
     if not uses_label_condition(train_mode):
         return False
@@ -613,9 +623,9 @@ def initialize_model_once(model, dataloader, device, is_distributed, local_rank,
     if is_distributed:
         dist.barrier()
         for param in model.parameters():
-            dist.broadcast(param.data, src=0)
+            broadcast_tensor_from_rank0_(param.data)
         for buffer in model.buffers():
-            dist.broadcast(buffer.data, src=0)
+            broadcast_tensor_from_rank0_(buffer.data)
         dist.barrier()
 
 
