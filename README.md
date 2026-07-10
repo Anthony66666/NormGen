@@ -87,14 +87,19 @@ bash scripts/train.sh /absolute/path/to/interaction_multi_train_combined.npz
 Prediction mode uses:
 
 - history: 10 frames
-- training target: 30 future frames padded internally to 32 for squeeze
-- saved samples, visualizations, and evaluation inputs: exactly the first 30 future frames
+- training target: 30 future dynamic states encoded as per-step deltas from the last valid history state
+- model time dimension: 30 frames with one flow block, so prediction does not use synthetic padding
+- saved samples, visualizations, and evaluation inputs: decoded absolute future states
 - label condition: disabled
 
 The default prediction config is intentionally conservative for the first
 server run: float32 training, per-valid-dimension loss normalization,
 `lr=5e-5`, and a single-process DataLoader. Increase worker count or re-enable
 AMP only after a short run remains finite.
+
+Start prediction training from a new checkpoint after switching to this config.
+The five-channel, one-block model is intentionally incompatible with older
+seven-channel, three-block prediction checkpoints.
 
 Initialization mode:
 

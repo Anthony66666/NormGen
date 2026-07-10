@@ -40,6 +40,10 @@ except ModuleNotFoundError:
     SummaryWriter = None
 
 from MapGlow11_27_original import Glow
+from trajectory_representation import (
+    decode_state_deltas_torch,
+    encode_state_deltas_np,
+)
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
@@ -284,6 +288,7 @@ class CombinedInteractionDataset(Dataset):
         history_steps=10,
         future_steps=30,
         prediction_target_steps=32,
+        prediction_representation="absolute",
         label_source="auto",
         turn_angle_threshold_deg=30.0,
         stationary_dist_threshold=0.0,
@@ -294,6 +299,16 @@ class CombinedInteractionDataset(Dataset):
             raise ValueError(f"train_mode must be initialization or prediction, got {train_mode}")
         if label_source not in ("auto", "none", "dataset", "target"):
             raise ValueError(f"label_source must be auto, none, dataset, or target, got {label_source}")
+        if prediction_representation not in ("absolute", "delta"):
+            raise ValueError(
+                "prediction_representation must be absolute or delta, got "
+                f"{prediction_representation}"
+            )
+        if train_mode == "prediction" and prediction_representation == "delta" and in_channel != 5:
+            raise ValueError(
+                "delta prediction represents the five dynamic trajectory channels; "
+                "use in_channel=5"
+            )
 
         data = np.load(combined_path, allow_pickle=True)
 
@@ -331,6 +346,10 @@ class CombinedInteractionDataset(Dataset):
 
         target_vehicle_mask = ~pad_pos.all(axis=1)              # [N, V]
         history_vehicle_mask = np.zeros_like(target_vehicle_mask)
+        history_timestep_mask = np.zeros(
+            (full_data.shape[0], 0, full_data.shape[3]), dtype=bool
+        )
+        target_timestep_mask = ~pad_pos
 
         if train_mode == "prediction":
             if history_steps <= 0:
@@ -350,6 +369,10 @@ class CombinedInteractionDataset(Dataset):
 
             history_data = full_data[:, :, :history_steps, :]
             future_data = full_data[:, :, history_steps:history_steps + future_steps, :]
+            history_timestep_mask = ~pad_pos[:, :history_steps, :]
+            future_timestep_mask = ~pad_pos[
+                :, history_steps:history_steps + future_steps, :
+            ]
             if prediction_target_steps > future_steps:
                 pad_shape = (
                     future_data.shape[0],
@@ -359,11 +382,32 @@ class CombinedInteractionDataset(Dataset):
                 )
                 pad_data = np.full(pad_shape, -1.0, dtype=future_data.dtype)
                 target_data = np.concatenate([future_data, pad_data], axis=2)
+                target_timestep_mask = np.concatenate(
+                    [
+                        future_timestep_mask,
+                        np.zeros(
+                            (
+                                future_data.shape[0],
+                                prediction_target_steps - future_steps,
+                                future_data.shape[3],
+                            ),
+                            dtype=bool,
+                        ),
+                    ],
+                    axis=1,
+                )
             else:
                 target_data = future_data
-            history_vehicle_mask = ~pad_pos[:, :history_steps, :].all(axis=1)
-            target_pad_pos = np.isclose(target_data[:, :5], -1.0, atol=0.05).all(axis=1)
-            target_vehicle_mask = ~target_pad_pos.all(axis=1)
+                target_timestep_mask = future_timestep_mask
+            history_vehicle_mask = history_timestep_mask.any(axis=1)
+            target_vehicle_mask = target_timestep_mask.any(axis=1)
+            if prediction_representation == "delta":
+                target_data = encode_state_deltas_np(
+                    target_data,
+                    history_data,
+                    target_timestep_mask,
+                    history_timestep_mask,
+                )
         else:
             history_data = full_data[:, :, :0, :]
             target_data = full_data
@@ -392,6 +436,8 @@ class CombinedInteractionDataset(Dataset):
         self.scene_stats = torch.from_numpy(scene_stats)
         self.target_vehicle_mask = torch.from_numpy(target_vehicle_mask)
         self.history_vehicle_mask = torch.from_numpy(history_vehicle_mask)
+        self.history_timestep_mask = torch.from_numpy(history_timestep_mask)
+        self.target_timestep_mask = torch.from_numpy(target_timestep_mask)
         self.map_names = map_names
 
         self.input_channels = int(target_data.shape[1])
@@ -403,6 +449,9 @@ class CombinedInteractionDataset(Dataset):
         self.history_steps = int(history_steps if train_mode == "prediction" else 0)
         self.future_steps = int(future_steps if train_mode == "prediction" else 0)
         self.prediction_target_steps = int(prediction_target_steps if train_mode == "prediction" else 0)
+        self.prediction_representation = (
+            prediction_representation if train_mode == "prediction" else "absolute"
+        )
         self.label_source = label_source_used
 
         valid_agents_per_scene = self.target_vehicle_mask.sum(dim=1).float()
@@ -433,6 +482,8 @@ class CombinedInteractionDataset(Dataset):
             self.history_vehicle_mask[idx],
             self.map_type[idx],
             self.map_speed_limit[idx],
+            self.target_timestep_mask[idx],
+            self.history_timestep_mask[idx],
         )
 
 
@@ -441,7 +492,7 @@ def calc_z_shapes(n_channel, input_size_h, input_size_w, n_block):
     if input_size_h % divisor != 0:
         raise ValueError(
             f"input_size_h={input_size_h} must be divisible by 2**n_block={divisor}. "
-            "For prediction mode use future_steps=30 with prediction_target_steps=32."
+            "Choose prediction_target_steps and n_block so no model padding is required."
         )
     z_shapes = []
     for _ in range(n_block - 1):
@@ -539,6 +590,7 @@ def build_dataloader(args, is_distributed, rank, world_size):
         history_steps=args.history_steps,
         future_steps=args.future_steps,
         prediction_target_steps=args.prediction_target_steps,
+        prediction_representation=getattr(args, "prediction_representation", "absolute"),
         label_source=args.label_source,
         turn_angle_threshold_deg=args.turn_angle_threshold_deg,
         stationary_dist_threshold=args.stationary_dist_threshold,
@@ -596,12 +648,14 @@ def process_batch(batch_raw, device, train_mode="initialization"):
     history_vehicle_mask = batch_raw[9].to(device, non_blocking=True) if use_history else None
     map_type = batch_raw[10].to(device, non_blocking=True)
     map_speed_limit = batch_raw[11].to(device, non_blocking=True)
+    timestep_mask = batch_raw[12].to(device, non_blocking=True)
+    history_timestep_mask = (
+        batch_raw[13].to(device, non_blocking=True) if use_history else None
+    )
     raw_labels = labels.clone()
     raw_agent_types = agent_types.clone()
 
     map_data = build_map_features(map_xy, map_mask, map_type)
-    timestep_mask = ~torch.isclose(target_data, torch.tensor(-1.0, device=device), atol=0.05).all(dim=1)
-
     valid_mask = target_vehicle_mask.bool()
     labels = torch.where(valid_mask, labels + 1, torch.zeros_like(labels))
     agent_types = torch.where(valid_mask, agent_types + 1, torch.zeros_like(agent_types))
@@ -619,10 +673,25 @@ def process_batch(batch_raw, device, train_mode="initialization"):
         "map_name": map_name,
         "target_vehicle_mask": target_vehicle_mask,
         "history_vehicle_mask": history_vehicle_mask,
+        "history_timestep_mask": history_timestep_mask,
         "timestep_mask": timestep_mask,
         "map_type": map_type,
         "map_speed_limit": map_speed_limit,
     }
+
+
+def decode_prediction_states(states, batch, args, timestep_mask=None):
+    representation = getattr(args, "prediction_representation", "absolute")
+    if args.train_mode != "prediction" or representation == "absolute":
+        return states
+    if representation != "delta":
+        raise ValueError(f"unsupported prediction representation: {representation}")
+    return decode_state_deltas_torch(
+        states,
+        batch["history_data"],
+        batch["timestep_mask"] if timestep_mask is None else timestep_mask,
+        batch["history_timestep_mask"],
+    )
 
 
 def build_model_context_kwargs(batch, train_mode="initialization"):
@@ -674,6 +743,13 @@ def save_samples_npz(model_single, batch, args, z_shapes, device, step):
     sample_gt = batch["target_data"][:batch_size]
     sample_map_type = batch["map_type"][:batch_size]
     sample_map_speed_limit = batch["map_speed_limit"][:batch_size]
+    sample_history_timestep_mask = batch.get("history_timestep_mask")
+    if sample_history_timestep_mask is None and batch.get("history_data") is not None:
+        sample_history_timestep_mask = ~torch.isclose(
+            batch["history_data"][:, :5],
+            torch.tensor(-1.0, device=batch["history_data"].device),
+            atol=0.05,
+        ).all(dim=1)
     sample_batch = {
         "map_data": batch["map_data"][:batch_size],
         "map_mask": batch["map_mask"][:batch_size],
@@ -689,6 +765,11 @@ def save_samples_npz(model_single, batch, args, z_shapes, device, step):
         "history_vehicle_mask": (
             batch["history_vehicle_mask"][:batch_size]
             if args.train_mode == "prediction" and batch["history_vehicle_mask"] is not None
+            else None
+        ),
+        "history_timestep_mask": (
+            sample_history_timestep_mask[:batch_size]
+            if args.train_mode == "prediction" and sample_history_timestep_mask is not None
             else None
         ),
     }
@@ -711,19 +792,22 @@ def save_samples_npz(model_single, batch, args, z_shapes, device, step):
             cond_sample = model_single.reverse(
                 z_cond,
                 **sample_model_kwargs,
-            ).cpu().data
+            )
+        cond_sample = decode_prediction_states(cond_sample, sample_batch, args).cpu().data
         conditional_samples.append(np.array(cond_sample))
 
         z_uncond = sample_latents(batch_size, z_shapes, device, args.temp, args.temp_block_decay)
         uncond_sample = model_single.reverse(
             z_uncond,
             **sample_model_kwargs,
-        ).cpu().data
+        )
+        uncond_sample = decode_prediction_states(uncond_sample, sample_batch, args).cpu().data
         unconditional_samples.append(np.array(uncond_sample))
 
     conditional_samples = np.stack(conditional_samples, axis=0)
     unconditional_samples = np.stack(unconditional_samples, axis=0)
-    saved_gt = np.array(sample_gt.cpu().data)
+    saved_gt_tensor = decode_prediction_states(sample_gt, sample_batch, args)
+    saved_gt = np.array(saved_gt_tensor.cpu().data)
     saved_timestep_mask = np.array(sample_batch["timestep_mask"].cpu().data)
     if args.train_mode == "prediction":
         conditional_samples = crop_time_steps(conditional_samples, args.future_steps, axis=3)
@@ -760,10 +844,18 @@ def save_samples_npz(model_single, batch, args, z_shapes, device, step):
         prediction_target_steps=np.int64(args.prediction_target_steps),
         saved_target_steps=np.int64(conditional_samples.shape[3]),
         label_source=np.asarray(args.label_source),
+        trajectory_representation=np.asarray("absolute"),
+        model_output_representation=np.asarray(
+            getattr(args, "prediction_representation", "absolute")
+        ),
     )
     if args.train_mode == "prediction":
         save_dict["history_data"] = np.array(sample_batch["history_data"].cpu().data)
         save_dict["history_vehicle_mask"] = np.array(sample_batch["history_vehicle_mask"].cpu().data)
+        if sample_batch["history_timestep_mask"] is not None:
+            save_dict["history_timestep_mask"] = np.array(
+                sample_batch["history_timestep_mask"].cpu().data
+            )
     np.savez(out_path, **save_dict)
     print(f"[samples] saved to {out_path}")
 
@@ -1430,6 +1522,12 @@ def main():
     parser.add_argument("--future_steps", default=30, type=int, help="real future steps used in prediction mode")
     parser.add_argument("--prediction_target_steps", default=32, type=int,
                         help="padded target length for prediction mode; must be divisible by 2**n_block")
+    parser.add_argument(
+        "--prediction_representation",
+        default="absolute",
+        choices=["absolute", "delta"],
+        help="prediction target representation; delta accumulates from the last valid history state",
+    )
     parser.add_argument("--label_source", default="auto", choices=["auto", "none", "dataset", "target"],
                         help="label semantics: prediction always uses none; auto=dataset for initialization")
     parser.add_argument("--turn_angle_threshold_deg", default=30.0, type=float,
@@ -1533,6 +1631,12 @@ def main():
             "prediction_target_steps must be divisible by 2**n_block. "
             f"Got prediction_target_steps={args.prediction_target_steps}, n_block={args.n_block}."
         )
+    if (
+        args.train_mode == "prediction"
+        and args.prediction_representation == "delta"
+        and args.in_channel != 5
+    ):
+        raise ValueError("delta prediction requires in_channel=5")
 
     print("Training args:")
     for key, value in vars(args).items():

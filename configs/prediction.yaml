@@ -8,24 +8,25 @@ iter: -1
 start_iter: 0
 
 n_flow: 16
-n_block: 3
+n_block: 1
 no_lu: false
 affine: true
 
 lr: 0.00005
 img_size_h: -1
 img_size_w: -1
-in_channel: 7
+in_channel: 5
 train_mode: prediction
 history_steps: 10
 future_steps: 30
-prediction_target_steps: 32
+prediction_target_steps: 30
+prediction_representation: delta
 label_source: none
 turn_angle_threshold_deg: 30.0
 stationary_dist_threshold: 0.0
 label_keep_prob: 0.0
 
-temp: 0.7
+temp: 0.3
 temp_block_decay: 1.0
 cfg_scale: 1.0
 n_modes: 6
