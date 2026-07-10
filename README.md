@@ -64,6 +64,14 @@ Run preprocessing:
 bash scripts/preprocess.sh /absolute/path/to/INTERACTION-Dataset-DR-multi-v1_2
 ```
 
+Prediction preprocessing is forecasting-safe by default: the selected agents,
+coordinate center, adaptive scale, maneuver labels, and map ranking are derived
+only from the first 10 observed frames. The archive stores explicit history,
+future, context-agent, and loss masks plus numeric normalization metadata.
+Prediction training rejects older archives without this contract unless the
+high-risk `--allow_legacy_prediction_data` override is supplied; that override
+cannot undo future leakage already baked into an old archive.
+
 By default this writes:
 
 ```text
@@ -84,6 +92,13 @@ Prediction mode is the default:
 bash scripts/train.sh /absolute/path/to/interaction_multi_train_combined.npz
 ```
 
+Use an independent validation archive with:
+
+```bash
+bash scripts/train.sh /absolute/path/to/interaction_multi_train_combined.npz \
+  --val_combined_path /absolute/path/to/interaction_multi_val_combined.npz
+```
+
 Prediction mode uses:
 
 - history: 10 frames
@@ -94,8 +109,10 @@ Prediction mode uses:
 
 The default prediction config is intentionally conservative for the first
 server run: float32 training, per-valid-dimension loss normalization,
-`lr=5e-5`, and a single-process DataLoader. Increase worker count or re-enable
-AMP only after a short run remains finite.
+`lr=5e-5`, and a single-process DataLoader. Increase worker count only after a
+short run remains finite. Keep AMP disabled for now: the validated path is
+FP32, while the RoPE scaled-dot-product attention mask still requires an
+explicit FP16/BF16 dtype compatibility fix.
 
 Start prediction training from a new checkpoint after switching to this config.
 The five-channel, one-block model is intentionally incompatible with older
@@ -175,8 +192,10 @@ bash scripts/train.sh /data/interaction_multi_train_combined.npz --save_sample_i
 Outputs:
 
 - full checkpoint: `results/last.pt`
+- best validation checkpoint: `results/best.pt`
 - legacy checkpoints: `results/model_interaction_combined.pt`, `results/optim_interaction_combined.pt`
 - samples: `results/*_interaction_combined_samples.npz`
+- machine-readable metrics: `results/training_metrics.jsonl` and `results/training_summary.json`
 - TensorBoard logs: `runs/`
 
 ## Server Quick Start

@@ -22,6 +22,7 @@ future_steps: 30
 prediction_target_steps: 30
 prediction_representation: delta
 label_source: none
+allow_legacy_prediction_data: false
 turn_angle_threshold_deg: 30.0
 stationary_dist_threshold: 0.0
 label_keep_prob: 0.0
@@ -35,13 +36,20 @@ num_workers: 0
 worker_start_method: ""
 persistent_workers: false
 prefetch_factor: 2
+disable_tqdm: false
 sample_interval: 2000
 save_interval: 2000
 save_epoch_interval: 1
+val_combined_path: ""
+val_batch: 0
+val_interval: 1
+val_num_modes: 6
+val_max_batches: -1
 
 log_dir: ./runs
 ckpt_dir: ./results
 sample_out_dir: ./results
+metrics_out_path: ""
 save_sample_images: false
 vis_num_scenes: 4
 vis_num_modes: 1
@@ -57,9 +65,12 @@ resume_model_only: false
 no_resume_iter: false
 save_step_checkpoints: false
 keep_legacy_checkpoints: true
+allow_partial_checkpoint: false
 loss_normalize: valid_dim
 
 amp: false
+amp_init_scale: 256.0
+grad_clip_norm: 5.0
 compile: false
 seed: 42
 deterministic: false

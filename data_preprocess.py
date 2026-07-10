@@ -106,6 +106,25 @@ def parse_args():
         help="Number of frames kept per scene.",
     )
     parser.add_argument(
+        "--history_steps",
+        type=int,
+        default=10,
+        help=(
+            "Number of leading observed frames used to define the forecasting "
+            "coordinate system and context-agent set."
+        ),
+    )
+    parser.add_argument(
+        "--forecasting_safe",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Derive agent selection, centering, adaptive scale, labels, and map "
+            "ranking only from the first --history_steps frames. Disable this "
+            "for legacy full-sequence initialization preprocessing."
+        ),
+    )
+    parser.add_argument(
         "--max_lanes",
         type=int,
         default=128,
@@ -194,7 +213,10 @@ def parse_args():
         "--require_full_trajectory",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Keep only agents that are visible in all seq_len frames.",
+        help=(
+            "Require visibility in every reference frame: history frames in "
+            "forecasting-safe mode, otherwise all seq_len frames."
+        ),
     )
     parser.add_argument(
         "--limit_scenes",
@@ -524,13 +546,30 @@ def build_scene_tensor(
     frame_ids = frame_ids[: args.seq_len]
     frame_to_idx = {frame_id: idx for idx, frame_id in enumerate(frame_ids)}
 
+    history_steps = int(getattr(args, "history_steps", min(10, args.seq_len)))
+    if history_steps <= 0 or history_steps > args.seq_len:
+        raise ValueError(
+            "history_steps must be in [1, seq_len], got "
+            f"history_steps={history_steps}, seq_len={args.seq_len}"
+        )
+    forecasting_safe = bool(getattr(args, "forecasting_safe", False))
+    if forecasting_safe and history_steps >= args.seq_len:
+        raise ValueError(
+            "forecasting-safe preprocessing requires at least one future frame: "
+            f"history_steps={history_steps}, seq_len={args.seq_len}"
+        )
+    reference_frame_ids = frame_ids[:history_steps] if forecasting_safe else frame_ids
+    reference_frame_count = len(reference_frame_ids)
+
     candidate_tracks = []
     track_groups = {}
     for track_id, track_df in case_df.groupby("track_id"):
         track_groups[track_id] = track_df
         frame_set = set(track_df["frame_id"].tolist())
-        covered = sum(frame_id in frame_set for frame_id in frame_ids)
-        if args.require_full_trajectory and covered != args.seq_len:
+        # In forecasting-safe mode, even the candidate set and its ordering must
+        # be reproducible at inference time, before any future row is observed.
+        covered = sum(frame_id in frame_set for frame_id in reference_frame_ids)
+        if args.require_full_trajectory and covered != reference_frame_count:
             continue
         if not args.require_full_trajectory and covered == 0:
             continue
@@ -540,13 +579,15 @@ def build_scene_tensor(
         return None, "no_valid_tracks"
 
     candidate_track_ids = [track_id for track_id, _ in candidate_tracks]
-    center = scene_center_from_tracks(case_df, frame_ids, candidate_track_ids)
+    center = scene_center_from_tracks(case_df, reference_frame_ids, candidate_track_ids)
 
     if args.agent_sort == "distance":
         candidate_tracks.sort(
             key=lambda item: (
                 -item[1],
-                track_distance_to_center(track_groups[item[0]], frame_ids, center),
+                track_distance_to_center(
+                    track_groups[item[0]], reference_frame_ids, center
+                ),
                 item[0],
             )
         )
@@ -554,13 +595,17 @@ def build_scene_tensor(
         candidate_tracks.sort(key=lambda item: (-item[1], item[0]))
 
     selected_track_ids = [track_id for track_id, _ in candidate_tracks[: args.max_agents]]
-    center = scene_center_from_tracks(case_df, frame_ids, selected_track_ids)
-    position_scale = compute_scene_scale(case_df, frame_ids, selected_track_ids, center, args)
+    center = scene_center_from_tracks(case_df, reference_frame_ids, selected_track_ids)
+    position_scale = compute_scene_scale(
+        case_df, reference_frame_ids, selected_track_ids, center, args
+    )
 
     traj = np.zeros((5, args.seq_len, args.max_agents), dtype=np.float32)
     dimensions = np.zeros((2, args.seq_len, args.max_agents), dtype=np.float32)
+    timestep_mask = np.zeros((args.seq_len, args.max_agents), dtype=bool)
     labels = np.full((args.max_agents,), args.placeholder_label, dtype=np.int64)
     agent_types = np.zeros((args.max_agents,), dtype=np.int64)
+    track_ids = np.full((args.max_agents,), -1, dtype=np.int64)
 
     for agent_slot, track_id in enumerate(selected_track_ids):
         track_df = track_groups[track_id].copy()
@@ -590,12 +635,22 @@ def build_scene_tensor(
             traj[4, t, agent_slot] = psi[row_idx]
             dimensions[0, t, agent_slot] = lengths[row_idx]
             dimensions[1, t, agent_slot] = widths[row_idx]
+            timestep_mask[t, agent_slot] = True
 
         if args.compute_labels:
-            labels[agent_slot] = infer_track_label(track_df, raw_psi, args)
+            if forecasting_safe:
+                label_rows = track_df[
+                    track_df["frame_id"].isin(reference_frame_ids)
+                ].copy()
+                label_psi = infer_yaw(label_rows)
+            else:
+                label_rows = track_df
+                label_psi = raw_psi
+            labels[agent_slot] = infer_track_label(label_rows, label_psi, args)
         else:
             labels[agent_slot] = args.placeholder_label
         agent_types[agent_slot] = map_agent_type(raw_agent_type)
+        track_ids[agent_slot] = int(track_id)
 
     map_data = np.zeros((args.max_lanes, args.num_points, 2), dtype=np.float32)
     map_mask = np.zeros((args.max_lanes, args.num_points), dtype=bool)
@@ -630,12 +685,28 @@ def build_scene_tensor(
     scene_stats = {
         "mean": center.astype(np.float32),
         "scale": np.float32(position_scale),
+        "reference": "history" if forecasting_safe else "full_sequence",
+        "history_steps": np.int64(history_steps),
     }
+    history_timestep_mask = timestep_mask[:history_steps].copy()
+    future_timestep_mask = timestep_mask[history_steps:].copy()
+    if forecasting_safe:
+        context_agent_mask = history_timestep_mask.any(axis=0)
+    else:
+        context_agent_mask = timestep_mask.any(axis=0)
+    future_vehicle_mask = future_timestep_mask.any(axis=0)
     return {
         "trajectories": traj,
         "dimensions": dimensions,
+        "timestep_mask": timestep_mask,
+        "history_timestep_mask": history_timestep_mask,
+        "future_timestep_mask": future_timestep_mask,
+        "vehicle_mask": context_agent_mask.copy(),
+        "context_agent_mask": context_agent_mask,
+        "future_vehicle_mask": future_vehicle_mask,
         "labels": labels,
         "agent_types": agent_types,
+        "track_ids": track_ids,
         "map_name": map_name,
         "scene_stats": scene_stats,
         "map_data": map_data,
@@ -665,8 +736,15 @@ def main():
     map_cache = {}
 
     trajectories = []
+    timestep_masks = []
+    history_timestep_masks = []
+    future_timestep_masks = []
+    vehicle_masks = []
+    context_agent_masks = []
+    future_vehicle_masks = []
     labels = []
     agent_types = []
+    track_ids = []
     map_names = []
     scene_stats = []
     dimensions = []
@@ -704,8 +782,15 @@ def main():
 
             trajectories.append(scene["trajectories"])
             dimensions.append(scene["dimensions"])
+            timestep_masks.append(scene["timestep_mask"])
+            history_timestep_masks.append(scene["history_timestep_mask"])
+            future_timestep_masks.append(scene["future_timestep_mask"])
+            vehicle_masks.append(scene["vehicle_mask"])
+            context_agent_masks.append(scene["context_agent_mask"])
+            future_vehicle_masks.append(scene["future_vehicle_mask"])
             labels.append(scene["labels"])
             agent_types.append(scene["agent_types"])
+            track_ids.append(scene["track_ids"])
             map_names.append(scene["map_name"])
             scene_stats.append(scene["scene_stats"])
             map_data_all.append(scene["map_data"])
@@ -726,8 +811,15 @@ def main():
 
     trajectories = np.stack(trajectories, axis=0).astype(np.float32)
     dimensions = np.stack(dimensions, axis=0).astype(np.float32)
+    timestep_masks = np.stack(timestep_masks, axis=0).astype(bool)
+    history_timestep_masks = np.stack(history_timestep_masks, axis=0).astype(bool)
+    future_timestep_masks = np.stack(future_timestep_masks, axis=0).astype(bool)
+    vehicle_masks = np.stack(vehicle_masks, axis=0).astype(bool)
+    context_agent_masks = np.stack(context_agent_masks, axis=0).astype(bool)
+    future_vehicle_masks = np.stack(future_vehicle_masks, axis=0).astype(bool)
     labels = np.stack(labels, axis=0).astype(np.int64)
     agent_types = np.stack(agent_types, axis=0).astype(np.int64)
+    track_ids = np.stack(track_ids, axis=0).astype(np.int64)
     map_data_all = np.stack(map_data_all, axis=0).astype(np.float32)
     map_mask_all = np.stack(map_mask_all, axis=0).astype(bool)
     map_type_all = np.stack(map_type_all, axis=0).astype(np.int64)
@@ -735,11 +827,11 @@ def main():
     map_names = np.asarray(map_names)
     scene_stats = np.asarray(scene_stats, dtype=object)
     scene_ids = np.asarray(scene_ids, dtype=np.int64)
+    normalization_center = np.stack(
+        [np.asarray(stat["mean"], dtype=np.float32) for stat in scene_stats], axis=0
+    ).astype(np.float32)
     scene_scales = np.asarray([float(stat["scale"]) for stat in scene_stats], dtype=np.float32)
-    valid_agent_mask = (
-        (np.abs(trajectories).sum(axis=(1, 2)) > 1e-8)
-        | (np.abs(dimensions).sum(axis=(1, 2)) > 1e-8)
-    )
+    valid_agent_mask = context_agent_masks
     valid_labels = labels[valid_agent_mask]
     label_values, label_counts = np.unique(valid_labels, return_counts=True)
 
@@ -749,10 +841,25 @@ def main():
         combined_out,
         trajectories=trajectories,
         dimensions=dimensions,
+        timestep_mask=timestep_masks,
+        history_timestep_mask=history_timestep_masks,
+        future_timestep_mask=future_timestep_masks,
+        vehicle_mask=vehicle_masks,
+        context_agent_mask=context_agent_masks,
+        future_vehicle_mask=future_vehicle_masks,
         labels=labels,
         agent_types=agent_types,
+        track_ids=track_ids,
         map_names=map_names,
         scene_stats=scene_stats,
+        normalization_center=normalization_center,
+        normalization_scale=scene_scales,
+        normalization_velocity_scale=np.float32(args.velocity_scale),
+        normalization_dimension_scale=np.float32(args.dimension_scale),
+        normalization_yaw_scale=np.float32(np.pi if args.normalize_yaw else 1.0),
+        normalization_metadata_version=np.int64(1),
+        history_steps=np.int64(args.history_steps),
+        forecasting_safe=np.bool_(args.forecasting_safe),
         label_mapping=np.asarray(LABEL_MAPPING, dtype=object),
         case_ids=scene_ids,
         map_data=map_data_all,
@@ -769,6 +876,10 @@ def main():
         "num_scenes": int(len(trajectories)),
         "trajectories_shape": tuple(trajectories.shape),
         "dimensions_shape": tuple(dimensions.shape),
+        "timestep_mask_shape": tuple(timestep_masks.shape),
+        "history_timestep_mask_shape": tuple(history_timestep_masks.shape),
+        "future_timestep_mask_shape": tuple(future_timestep_masks.shape),
+        "context_agent_mask_shape": tuple(context_agent_masks.shape),
         "map_shape": tuple(map_data_all.shape),
         "map_type_shape": tuple(map_type_all.shape),
         "map_speed_limit_shape": tuple(map_speed_limit_all.shape),
@@ -782,6 +893,9 @@ def main():
         "velocity_scale": float(args.velocity_scale),
         "dimension_scale": float(args.dimension_scale),
         "normalize_yaw": bool(args.normalize_yaw),
+        "history_steps": int(args.history_steps),
+        "forecasting_safe": bool(args.forecasting_safe),
+        "normalization_metadata_version": 1,
         "placeholder_label": int(args.placeholder_label),
         "compute_labels": bool(args.compute_labels),
         "stationary_dist_threshold": float(args.stationary_dist_threshold),

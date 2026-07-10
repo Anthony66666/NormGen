@@ -81,27 +81,49 @@ def gaussian_log_p(x, mean, log_sd, mask=None):
     Returns:
         log_p per sample [B] (summed over valid positions only)
     """
-    # Clamp log_sd to prevent numerical instability
-    log_sd = torch.clamp(log_sd, min=-10.0, max=10.0)
-    
-    # Clamp the squared term to prevent overflow
-    diff_sq = torch.clamp((x - mean) ** 2, max=1e6)
-    var = torch.exp(2 * log_sd).clamp(min=1e-10)
-    
-    log_p_elem = -0.5 * log(2 * pi) - log_sd - 0.5 * diff_sq / var
-    
+    # Keep the distribution a genuine Gaussian: clipping the residual (or its
+    # square) would create constant-density tails and an unnormalisable
+    # objective.  Only the *predicted parameter* is bounded.  Low precision
+    # inputs are promoted for the exponent/square, which is where fp16 usually
+    # overflows first.
+    calc_dtype = (
+        torch.float32
+        if x.dtype in (torch.float16, torch.bfloat16)
+        else x.dtype
+    )
+    x_calc = x.to(calc_dtype)
+    mean_calc = mean.to(calc_dtype)
+    log_sd_calc = torch.clamp(log_sd.to(calc_dtype), min=-10.0, max=10.0)
+
     if mask is not None:
-        # torch.where avoids propagating NaN from an invalid position through
-        # the otherwise tempting NaN * 0 masking pattern.
-        log_p_elem = torch.where(mask.bool(), log_p_elem, torch.zeros_like(log_p_elem))
+        valid = mask.bool()
+        # Avoid evaluating undefined arithmetic at ignored positions (for
+        # example inf - inf).  Valid positions retain the exact Gaussian tail.
+        x_calc = torch.where(valid, x_calc, mean_calc)
+    else:
+        valid = None
+
+    standardized = (x_calc - mean_calc) * torch.exp(-log_sd_calc)
+    log_p_elem = -0.5 * log(2 * pi) - log_sd_calc - 0.5 * standardized.square()
+
+    if valid is not None:
+        log_p_elem = torch.where(valid, log_p_elem, torch.zeros_like(log_p_elem))
     
     return log_p_elem
 
 
 def gaussian_sample(eps, mean, log_sd):
-    # Clamp log_sd to prevent extreme values
-    log_sd = torch.clamp(log_sd, min=-10.0, max=10.0)
-    return mean + torch.exp(log_sd) * eps
+    # Sampling uses the identical bounded Gaussian parameterisation as the
+    # likelihood.  Compute the exponential in fp32 under mixed precision.
+    calc_dtype = (
+        torch.float32
+        if eps.dtype in (torch.float16, torch.bfloat16)
+        else eps.dtype
+    )
+    sample = mean.to(calc_dtype) + torch.exp(
+        torch.clamp(log_sd.to(calc_dtype), min=-10.0, max=10.0)
+    ) * eps.to(calc_dtype)
+    return sample.to(mean.dtype)
 
 
 def create_vehicle_mask(data, threshold=1e-6):
@@ -190,10 +212,50 @@ def squeeze_channel_mask(channel_mask, squeeze_factor=2):
 class ActNorm(nn.Module):
     def __init__(self, in_channel, logdet=True):
         super().__init__()
-        self.loc   = nn.Parameter(torch.zeros(1, in_channel, 1, 1))
-        self.scale = nn.Parameter(torch.ones(1, in_channel, 1, 1))
+        self.loc = nn.Parameter(torch.zeros(1, in_channel, 1, 1))
+        # A directly-optimised scale can cross (or become exactly) zero.  A
+        # log-scale makes every representable transform strictly positive and
+        # therefore invertible.  `_load_from_state_dict` below migrates the
+        # legacy `scale` parameter transparently.
+        self.log_scale = nn.Parameter(torch.zeros(1, in_channel, 1, 1))
+        self.register_buffer("scale_sign", torch.ones(1, in_channel, 1, 1))
         self.register_buffer("initialized", torch.tensor(False, dtype=torch.bool))
         self.logdet = logdet
+
+    def _bounded_log_scale(self):
+        # This range remains non-zero in fp16 and avoids exp overflow while
+        # retaining a broad useful dynamic range.
+        return torch.clamp(self.log_scale, min=-10.0, max=10.0)
+
+    def _effective_scale(self):
+        # Magnitude is strictly positive; the fixed sign buffer exists solely
+        # to preserve reflections from legacy checkpoints.
+        return self.scale_sign * torch.exp(self._bounded_log_scale())
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict,
+        missing_keys, unexpected_keys, error_msgs,
+    ):
+        legacy_key = prefix + "scale"
+        new_key = prefix + "log_scale"
+        if legacy_key in state_dict and new_key not in state_dict:
+            legacy_scale = state_dict.pop(legacy_key)
+            state_dict[prefix + "scale_sign"] = torch.where(
+                legacy_scale >= 0,
+                torch.ones_like(legacy_scale),
+                -torch.ones_like(legacy_scale),
+            )
+            state_dict[new_key] = torch.log(
+                legacy_scale.abs().clamp_min(torch.finfo(legacy_scale.dtype).tiny)
+            )
+        elif legacy_key in state_dict:
+            # Do not report a stale compatibility key as unexpected when a
+            # checkpoint contains both representations.
+            state_dict.pop(legacy_key)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
 
     @torch.no_grad()
     def initialize(self, x, mask=None):
@@ -229,7 +291,7 @@ class ActNorm(nn.Module):
         
         std = torch.sqrt(var + 1e-6)
         self.loc.data.copy_(-mean)
-        self.scale.data.copy_(1.0 / std)
+        self.log_scale.data.copy_(-torch.log(std))
 
     def forward(self, x, mask=None):
         """
@@ -241,10 +303,11 @@ class ActNorm(nn.Module):
         if not self.initialized:
             self.initialize(x, mask=mask)
             self.initialized.fill_(True)
-        y = self.scale * (x + self.loc)
+        scale = self._effective_scale()
+        y = scale * (x + self.loc)
         if not self.logdet:
             return y
-        log_abs = logabs(self.scale)  # [1, C, 1, 1]
+        log_abs = self._bounded_log_scale()  # [1, C, 1, 1]
         
         if mask is not None:
             # 计算每个样本的有效元素数
@@ -262,17 +325,122 @@ class ActNorm(nn.Module):
         return y, logdet
 
     def reverse(self, y):
-        return y / (self.scale + 1e-12) - self.loc
+        return y * self.scale_sign * torch.exp(-self._bounded_log_scale()) - self.loc
 
 
 # ------------------------- Invertible 1x1 conv -------------------------
 class InvConv2d(nn.Module):
-    def __init__(self, in_channel):
+    """Invertible 1x1 convolution with two genuinely distinct backends.
+
+    ``lu=True`` is the Glow-style default.  Its diagonal is represented as
+    ``sign * exp(log_s)``, so singular matrices cannot be reached during
+    optimisation and the log-determinant is inexpensive and exact.
+
+    ``lu=False`` uses a dense matrix exponential.  It is slower, but remains
+    strictly invertible for every finite parameter value and therefore is a
+    safe implementation of the CLI's non-LU option rather than an ignored
+    flag.  Both backends can ingest the legacy dense ``weight`` state key.
+    """
+
+    def __init__(self, in_channel, lu=True):
         super().__init__()
-        weight = torch.randn(in_channel, in_channel)
-        q, _ = torch.linalg.qr(weight, mode='reduced')
-        weight = q.unsqueeze(2).unsqueeze(3)
-        self.weight = nn.Parameter(weight)
+        self.in_channel = int(in_channel)
+        self.lu = bool(lu)
+
+        if self.lu:
+            initial = torch.randn(self.in_channel, self.in_channel)
+            q, _ = torch.linalg.qr(initial, mode="reduced")
+            p, lower, upper = torch.linalg.lu(q)
+            diag = torch.diagonal(upper)
+            sign_s = torch.where(diag >= 0, torch.ones_like(diag), -torch.ones_like(diag))
+
+            self.register_buffer("p", p)
+            self.lower = nn.Parameter(torch.tril(lower, diagonal=-1))
+            self.upper = nn.Parameter(torch.triu(upper, diagonal=1))
+            self.register_buffer("sign_s", sign_s)
+            self.log_s = nn.Parameter(torch.log(diag.abs().clamp_min(1e-6)))
+        else:
+            # A fixed invertible base carries the initial channel permutation
+            # (and determinant sign), while exp(A) supplies a trainable dense
+            # update.  This also lets a legacy dense weight be represented
+            # exactly as base=W, A=0.
+            initial = torch.randn(self.in_channel, self.in_channel)
+            dense_base, _ = torch.linalg.qr(initial, mode="reduced")
+            self.register_buffer("dense_base", dense_base)
+            self.matrix_log = nn.Parameter(torch.zeros_like(dense_base))
+
+    @staticmethod
+    def _lu_factors(weight):
+        p, lower, upper = torch.linalg.lu(weight)
+        diag = torch.diagonal(upper)
+        sign_s = torch.where(diag >= 0, torch.ones_like(diag), -torch.ones_like(diag))
+        return (
+            p,
+            torch.tril(lower, diagonal=-1),
+            torch.triu(upper, diagonal=1),
+            sign_s,
+            torch.log(diag.abs().clamp_min(1e-12)),
+        )
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict,
+        missing_keys, unexpected_keys, error_msgs,
+    ):
+        legacy_key = prefix + "weight"
+        if legacy_key in state_dict:
+            legacy_weight = state_dict.pop(legacy_key).squeeze(-1).squeeze(-1)
+            if self.lu and prefix + "log_s" not in state_dict:
+                p, lower, upper, sign_s, log_s = self._lu_factors(legacy_weight)
+                state_dict[prefix + "p"] = p
+                state_dict[prefix + "lower"] = lower
+                state_dict[prefix + "upper"] = upper
+                state_dict[prefix + "sign_s"] = sign_s
+                state_dict[prefix + "log_s"] = log_s
+            elif not self.lu and prefix + "matrix_log" not in state_dict:
+                sign, _ = torch.linalg.slogdet(legacy_weight.double())
+                if sign == 0:
+                    # A singular legacy matrix never defined a valid flow.
+                    # Project only that invalid edge case to the nearest
+                    # full-rank matrix so the migrated model is well-defined.
+                    u, singular_values, vh = torch.linalg.svd(legacy_weight)
+                    legacy_weight = u @ torch.diag(singular_values.clamp_min(1e-6)) @ vh
+                state_dict[prefix + "dense_base"] = legacy_weight
+                state_dict[prefix + "matrix_log"] = torch.zeros_like(legacy_weight)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
+
+    def _dense_generator(self):
+        # Smoothly bound the Frobenius norm below four.  This prevents matrix
+        # exponential overflow without introducing a singular projection.
+        norm = torch.linalg.vector_norm(self.matrix_log)
+        return self.matrix_log * (4.0 / (4.0 + norm))
+
+    def _assemble_weight(self):
+        if self.lu:
+            dtype = self.lower.dtype
+            device = self.lower.device
+            eye = torch.eye(self.in_channel, device=device, dtype=dtype)
+            lower = torch.tril(self.lower, diagonal=-1) + eye
+            bounded_log_s = torch.clamp(self.log_s, min=-10.0, max=10.0)
+            upper = torch.triu(self.upper, diagonal=1) + torch.diag(
+                self.sign_s.to(dtype) * torch.exp(bounded_log_s)
+            )
+            weight = self.p.to(dtype) @ lower @ upper
+            log_abs_det = bounded_log_s.sum()
+        else:
+            generator = self._dense_generator()
+            weight = self.dense_base.to(generator.dtype) @ torch.matrix_exp(generator)
+            # det(B exp(A)) = det(B) exp(trace(A)).
+            base_logdet = torch.linalg.slogdet(self.dense_base.double())[1].to(generator.dtype)
+            log_abs_det = base_logdet + torch.diagonal(generator).sum()
+        return weight, log_abs_det
+
+    @property
+    def weight(self):
+        """Materialised convolution kernel (read-only compatibility view)."""
+        return self._assemble_weight()[0].unsqueeze(-1).unsqueeze(-1)
 
     def forward(self, x, mask=None):
         """
@@ -281,7 +449,9 @@ class InvConv2d(nn.Module):
             mask: optional [B, C, H, W] or [B, 1, H, W] bool, True = valid
         """
         B, C, H, W = x.shape
-        det_w = torch.slogdet(self.weight.squeeze().double())[1].float()
+        weight, det_w = self._assemble_weight()
+        kernel = weight.to(device=x.device, dtype=x.dtype).unsqueeze(-1).unsqueeze(-1)
+        det_w = det_w.to(device=x.device, dtype=x.dtype)
         
         if mask is not None:
             if mask.dim() == 4:
@@ -293,18 +463,21 @@ class InvConv2d(nn.Module):
                     spatial_mask = mask.all(dim=1, keepdim=True)
             else:
                 spatial_mask = mask.unsqueeze(1)
-            transformed = F.conv2d(x, self.weight)
+            transformed = F.conv2d(x, kernel)
             out = torch.where(spatial_mask, transformed, x)
             valid_count = spatial_mask.float().view(B, -1).sum(dim=1)
             logdet = det_w * valid_count
         else:
-            out = F.conv2d(x, self.weight)
+            out = F.conv2d(x, kernel)
             logdet = (H * W * det_w).unsqueeze(0).repeat(B)
         
         return out, logdet
 
     def reverse(self, y, mask=None):
-        w_inv = self.weight.squeeze().inverse().unsqueeze(2).unsqueeze(3)
+        weight, _ = self._assemble_weight()
+        weight = weight.to(device=y.device, dtype=y.dtype)
+        identity = torch.eye(self.in_channel, device=y.device, dtype=y.dtype)
+        w_inv = torch.linalg.solve(weight, identity).unsqueeze(2).unsqueeze(3)
         if mask is not None:
             if mask.dim() == 4:
                 if mask.shape[1] == 1:
@@ -361,7 +534,7 @@ class AgentInteractionModule(nn.Module):
         
         # 跨agent注意力（考虑相对关系）
         self.cross_agent_attn = nn.ModuleList([
-            nn.MultiheadAttention(embed_dim=filter_size, num_heads=num_heads, batch_first=True, dropout=0.1)
+            nn.MultiheadAttention(embed_dim=filter_size, num_heads=num_heads, batch_first=True, dropout=0.0)
             for _ in range(num_layers)
         ])
         self.cross_agent_ln = nn.ModuleList([nn.LayerNorm(filter_size) for _ in range(num_layers)])
@@ -372,7 +545,7 @@ class AgentInteractionModule(nn.Module):
         self.cross_agent_ln2 = nn.ModuleList([nn.LayerNorm(filter_size) for _ in range(num_layers)])
         
         # 时空联合交互
-        self.spatiotemporal_attn = nn.MultiheadAttention(embed_dim=filter_size, num_heads=num_heads, batch_first=True, dropout=0.1)
+        self.spatiotemporal_attn = nn.MultiheadAttention(embed_dim=filter_size, num_heads=num_heads, batch_first=True, dropout=0.0)
         self.st_ln1 = nn.LayerNorm(filter_size)
         self.st_ffn = nn.Sequential(nn.Linear(filter_size, filter_size*4), nn.GELU(), nn.Linear(filter_size*4, filter_size))
         self.st_ln2 = nn.LayerNorm(filter_size)
@@ -408,8 +581,11 @@ class AgentInteractionModule(nn.Module):
         
         # 计算相对航向 [B, T, V, V, 1]
         yaw_t = yaw.permute(0, 2, 3, 1)  # [B, T, V, 1]
-        rel_yaw = yaw_t.unsqueeze(3) - yaw_t.unsqueeze(2)  # [B, T, V, V, 1]
-        rel_yaw = torch.atan2(torch.sin(rel_yaw), torch.cos(rel_yaw))  # 归一化到[-pi, pi]
+        # Dataset yaw is normalised by pi.  Trigonometric wrapping must operate
+        # in radians; using yaw/pi directly as radians underestimates every
+        # angular difference by a factor of pi.
+        rel_yaw_rad = (yaw_t.unsqueeze(3) - yaw_t.unsqueeze(2)) * torch.pi
+        rel_yaw = torch.atan2(torch.sin(rel_yaw_rad), torch.cos(rel_yaw_rad))
         
         # 计算距离 [B, T, V, V, 1]
         dist = torch.sqrt((rel_pos ** 2).sum(dim=-1, keepdim=True) + 1e-6)
@@ -435,6 +611,19 @@ class AgentInteractionModule(nn.Module):
         
         # 跨agent注意力（每个时间步）
         agent_out = agent_feat.permute(0, 2, 1, 3).reshape(B * T, V, F)  # [B*T, V, F]
+
+        # Make the previously-unused pair encoder an actual part of the
+        # interaction path.  Each query agent receives a masked mean of its
+        # neighbours' relative-motion embeddings.
+        rel_encoded = self.relative_encoder(rel_feat)  # [B,T,V,V,F]
+        neighbour_valid = torch.ones(B, T, V, V, device=device, dtype=torch.bool)
+        if vehicle_mask is not None:
+            neighbour_valid = neighbour_valid & vehicle_mask[:, None, None, :]
+        if timestep_mask is not None:
+            neighbour_valid = neighbour_valid & timestep_mask[:, :, None, :]
+        neighbour_weight = neighbour_valid.unsqueeze(-1).to(rel_encoded.dtype)
+        relative_context = (rel_encoded * neighbour_weight).sum(dim=3) / neighbour_weight.sum(dim=3).clamp(min=1.0)
+        agent_out = agent_out + relative_context.reshape(B * T, V, F)
         
         # 创建注意力mask
         if timestep_mask is not None and vehicle_mask is not None:
@@ -456,10 +645,15 @@ class AgentInteractionModule(nn.Module):
         for i in range(len(self.cross_agent_attn)):
             rel_bias = torch.tanh(self.relative_bias(rel_feat))  # [B, T, V, V, H]
             rel_bias = rel_bias.permute(0, 1, 4, 2, 3).reshape(B * T * self.num_heads, V, V)
+            padding_mask_for_attn = (
+                attn_key_padding_mask.to(dtype=rel_bias.dtype)
+                if attn_key_padding_mask is not None
+                else None
+            )
             
             attn_out, _ = self.cross_agent_attn[i](
                 query=agent_out, key=agent_out, value=agent_out,
-                key_padding_mask=attn_key_padding_mask,
+                key_padding_mask=padding_mask_for_attn,
                 attn_mask=rel_bias
             )
             if all_pad is not None and all_pad.any():
@@ -532,7 +726,7 @@ class LaneAwareAttention(nn.Module):
         
         # Agent-to-lane注意力（带方向bias）
         self.agent_to_lane_attn = nn.MultiheadAttention(
-            embed_dim=filter_size, num_heads=num_heads, batch_first=True, dropout=0.1
+            embed_dim=filter_size, num_heads=num_heads, batch_first=True, dropout=0.0
         )
         self.a2l_ln1 = nn.LayerNorm(filter_size)
         self.a2l_ffn = nn.Sequential(
@@ -629,7 +823,17 @@ class LaneAwareAttention(nn.Module):
         
         if lane_data is not None and lane_mask is not None:
             dir_encoded = self.compute_direction_features(agent_pos, agent_vel, lane_data, lane_mask)  # [B, V, K, F]
-            lane_feat = lane_feat + dir_encoded.reshape(BV, K, F)
+            lane_valid = lane_mask.any(dim=-1)
+            if agent_valid_mask is not None:
+                lane_valid = lane_valid & agent_valid_mask.unsqueeze(-1)
+            lane_weight = lane_valid.unsqueeze(-1).to(dir_encoded.dtype)
+            lane_global = (dir_encoded * lane_weight).sum(dim=2, keepdim=True) / lane_weight.sum(dim=2, keepdim=True).clamp(min=1.0)
+            lane_global = lane_global.expand(-1, -1, K, -1)
+            lane_feat = self.lane_scale_fusion(torch.cat([
+                lane_feat.view(B, V, K, F),
+                dir_encoded,
+                lane_global,
+            ], dim=-1)).reshape(BV, K, F)
             lane_pad = ~lane_mask.any(dim=-1).reshape(BV, K)  # [B*V, K]
         else:
             lane_pad = (lane_feat.abs().sum(dim=-1) < 1e-6)  # [B*V, K]
@@ -660,6 +864,11 @@ class LaneAwareAttention(nn.Module):
         compliance_score = self.compliance_head(compliance_feat).view(B, V)
         if agent_valid_mask is not None:
             compliance_score = compliance_score * agent_valid_mask.float()
+        # Feed the score back as a near-identity feature gate so the
+        # compliance head is trained by the flow likelihood even when no
+        # auxiliary compliance loss is configured.
+        compliance_gate = 0.5 + compliance_score.reshape(BV, 1, 1)
+        out = out * compliance_gate
         
         return out, compliance_score
 
@@ -690,7 +899,7 @@ class MapFeatureExtractor(nn.Module):
         self.global_attn_ln2 = nn.LayerNorm(filter_size)
         
         # 新增：多层lane交互
-        self.lane_inter_attn = nn.MultiheadAttention(embed_dim=filter_size, num_heads=num_heads, batch_first=True, dropout=0.1)
+        self.lane_inter_attn = nn.MultiheadAttention(embed_dim=filter_size, num_heads=num_heads, batch_first=True, dropout=0.0)
         self.lane_inter_ln1 = nn.LayerNorm(filter_size)
         self.lane_inter_ffn = nn.Sequential(
             nn.Linear(filter_size, filter_size*4), nn.GELU(), nn.Linear(filter_size*4, filter_size)
@@ -1080,12 +1289,14 @@ class TemporalTransformer(nn.Module):
 # ------------------------- Unified Spatio-Temporal Extractor (2D RoPE spatial) -------------------------
 class UnifiedSpatioTemporalExtractor(nn.Module):
     def __init__(self, input_dim, filter_size, num_heads=8, num_layers=2, max_seq_len=80, causal=False,
-                 max_agents=64, pos_xy_channels=(0, 1), yaw_channel=4, rope_init_scene_diam_m=2.0):
+                 max_agents=64, pos_xy_channels=(0, 1), yaw_channel=4, rope_init_scene_diam_m=2.0,
+                 use_input_coordinates=True):
         super().__init__()
         self.filter_size = filter_size
         self.max_agents = max_agents
         self.pos_xy_channels = pos_xy_channels
         self.yaw_channel = yaw_channel
+        self.use_input_coordinates = bool(use_input_coordinates)
         self.temporal_transformer = TemporalTransformer(
             input_dim=input_dim, filter_size=filter_size, num_heads=num_heads, num_layers=num_layers,
             max_seq_len=max_seq_len, causal=causal
@@ -1100,12 +1311,15 @@ class UnifiedSpatioTemporalExtractor(nn.Module):
         self.spatial_ln2 = nn.LayerNorm(filter_size)
         self.fusion_layer = nn.Linear(filter_size * 2, filter_size)
 
-    def forward(self, x, vehicle_mask=None, timestep_mask=None):
+    def forward(self, x, vehicle_mask=None, timestep_mask=None, spatial_coords=None):
         """
         Args:
             x: [B, C, T, V] input tensor
             vehicle_mask: [B, V] bool, True = valid vehicle
             timestep_mask: [B, T, V] bool, True = valid timestep
+            spatial_coords: optional exogenous coordinates, either [B,V,2] or
+                [B,T,V,2].  When omitted, raw input x/y are used only if
+                ``use_input_coordinates`` was enabled at construction.
         """
         B, C, T, V = x.shape
         if vehicle_mask is None:
@@ -1127,8 +1341,28 @@ class UnifiedSpatioTemporalExtractor(nn.Module):
         else:
             spatial_mask = ~vehicle_mask.unsqueeze(1).expand(B, T, V).reshape(B * T, V)
         
-        # coords from x (pos channels 0,1)
-        coords_bt_v2 = x[:, (0, 1), :, :].permute(0, 2, 3, 1).reshape(B * T, V, 2)
+        if spatial_coords is not None:
+            if spatial_coords.dim() == 3 and tuple(spatial_coords.shape) == (B, V, 2):
+                coords = spatial_coords.unsqueeze(1).expand(B, T, V, 2)
+            elif spatial_coords.dim() == 4 and tuple(spatial_coords.shape) == (B, T, V, 2):
+                coords = spatial_coords
+            else:
+                raise ValueError(
+                    "spatial_coords must be [B,V,2] or [B,T,V,2], got "
+                    f"{tuple(spatial_coords.shape)} for B={B}, T={T}, V={V}"
+                )
+            coords_bt_v2 = coords.to(device=x.device, dtype=x.dtype).reshape(B * T, V, 2)
+        elif self.use_input_coordinates:
+            if self.pos_xy_channels is None or max(self.pos_xy_channels) >= C:
+                raise ValueError(
+                    f"input has {C} channels but coordinate channels are {self.pos_xy_channels}"
+                )
+            coords_bt_v2 = x[:, self.pos_xy_channels, :, :].permute(0, 2, 3, 1).reshape(B * T, V, 2)
+        else:
+            # A zero coordinate field makes RoPE reduce to ordinary spatial
+            # attention.  This is the safe fallback for latent flow features,
+            # whose channel identities have been destroyed by squeeze/1x1 conv.
+            coords_bt_v2 = x.new_zeros(B * T, V, 2)
         spatial_feat = self.spatial_attn_rope(spatial_input, coords_bt_v2, key_padding_mask=spatial_mask)
         res_s = spatial_input + spatial_feat
         s1 = self.spatial_ln1(res_s)
@@ -1238,6 +1472,16 @@ class ContextEncoder(nn.Module):
         self.scene_pool_attn = nn.MultiheadAttention(embed_dim=filter_size, num_heads=num_heads, batch_first=True, dropout=0.0)
         self.agent_query_proj = nn.Linear(filter_size, filter_size)
         self.lane_key_proj = nn.Linear(filter_size, filter_size)
+        self.scene_stats_encoder = nn.Sequential(
+            nn.Linear(3, filter_size),
+            nn.ReLU(inplace=True),
+            nn.Linear(filter_size, filter_size),
+        )
+        self.static_dimensions_encoder = nn.Sequential(
+            nn.Linear(2, filter_size),
+            nn.ReLU(inplace=True),
+            nn.Linear(filter_size, filter_size),
+        )
         
         # 新增：Agent交互模块
         self.agent_interaction = AgentInteractionModule(filter_size=filter_size, num_heads=num_heads, num_layers=2)
@@ -1250,6 +1494,25 @@ class ContextEncoder(nn.Module):
             nn.Linear(filter_size * 2, filter_size),
             nn.ReLU(inplace=True),
             nn.Linear(filter_size, filter_size)
+        )
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict,
+        missing_keys, unexpected_keys, error_msgs,
+    ):
+        # These encoders were introduced for forecasting-safe metadata.  Old
+        # checkpoints have no corresponding learned values, so retain the new
+        # module's initialisation while allowing the rest of the checkpoint to
+        # remain strictly checked.
+        own_state = self.state_dict()
+        for local_key in own_state:
+            if local_key.startswith(("scene_stats_encoder.", "static_dimensions_encoder.")):
+                full_key = prefix + local_key
+                if full_key not in state_dict:
+                    state_dict[full_key] = own_state[local_key].detach().clone()
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
         )
 
     def _pool_scene_token(self, lane_feat_shared, lane_valid_mask):
@@ -1273,7 +1536,7 @@ class ContextEncoder(nn.Module):
 
         return pooled.squeeze(1)
 
-    def _build_agent_queries(self, type_emb, label_emb, agent_valid_mask, scene_token):
+    def _build_agent_queries(self, type_emb, label_emb, agent_valid_mask, scene_token, extra_emb=None):
         B, V = agent_valid_mask.shape
         device = agent_valid_mask.device
         base = torch.zeros(B, V, self.filter_size, device=device)
@@ -1281,6 +1544,8 @@ class ContextEncoder(nn.Module):
             base = base + type_emb
         if label_emb is not None:
             base = base + label_emb
+        if extra_emb is not None:
+            base = base + extra_emb
         if scene_token is not None:
             scene_expanded = scene_token.unsqueeze(1).expand(B, V, -1)
             base = self.multi_scale_fusion(torch.cat([base, scene_expanded], dim=-1))
@@ -1352,7 +1617,10 @@ class ContextEncoder(nn.Module):
         gathered = torch.gather(feat, 1, gather_idx).squeeze(1)
         return gathered.view(B, V, -1)
 
-    def _extract_agent_anchor(self, history_data, history_vehicle_mask, agent_valid_mask):
+    def _extract_agent_anchor(
+        self, history_data, history_vehicle_mask, agent_valid_mask,
+        history_timestep_mask=None,
+    ):
         """Compute last valid history position and index per agent."""
         B, V = agent_valid_mask.shape
         if history_data is None:
@@ -1366,7 +1634,16 @@ class ContextEncoder(nn.Module):
         dtype = history_data.dtype
         anchor = torch.zeros(B, V, 2, device=device, dtype=dtype)
 
-        timestep_mask = create_timestep_mask(history_data, padding_value=-1.0)  # [B, T_hist, V]
+        if history_timestep_mask is None:
+            timestep_mask = create_timestep_mask(history_data, padding_value=-1.0)
+        else:
+            expected = (B, history_data.shape[2], V)
+            if tuple(history_timestep_mask.shape) != expected:
+                raise ValueError(
+                    f"history_timestep_mask must have shape {expected}, got "
+                    f"{tuple(history_timestep_mask.shape)}"
+                )
+            timestep_mask = history_timestep_mask.to(device=device).bool()
         agent_time_mask = timestep_mask.permute(0, 2, 1)  # [B, V, T_hist]
         has_valid = agent_time_mask.any(dim=2)
         if history_vehicle_mask is not None:
@@ -1380,6 +1657,30 @@ class ContextEncoder(nn.Module):
         gathered = self._gather_last_valid_feature(history_data, last_idx, slice(0, 2))
         anchor = torch.where(anchor_valid.unsqueeze(-1), gathered, anchor)
         return anchor, anchor_valid, timestep_mask, last_idx
+
+    @staticmethod
+    def _metric_rope_anchor(agent_anchor_xy, scene_stats):
+        """Convert scene-normalised history anchors to metre-scale offsets.
+
+        RoPE centres coordinates across agents internally, so restoring the
+        global scene centre would have no effect. Restoring the per-scene
+        position scale is essential, however: without it the same RoPE phase
+        distance represents a different number of metres in every scene.
+        """
+        if scene_stats is None:
+            return agent_anchor_xy
+        expected = (agent_anchor_xy.shape[0], 3)
+        if tuple(scene_stats.shape) != expected:
+            raise ValueError(
+                f"scene_stats must be {expected}, got {tuple(scene_stats.shape)}"
+            )
+        position_scale = scene_stats[:, 2].to(
+            device=agent_anchor_xy.device,
+            dtype=agent_anchor_xy.dtype,
+        )
+        if not torch.isfinite(position_scale).all() or (position_scale <= 0).any():
+            raise ValueError("scene_stats position_scale must be finite and positive")
+        return agent_anchor_xy * position_scale.view(-1, 1, 1)
 
     def _select_topk_lanes(self, lane_feat_shared, map_data, map_mask,
                            agent_xy, agent_valid_mask, anchor_valid_mask):
@@ -1445,6 +1746,10 @@ class ContextEncoder(nn.Module):
         history_data=None,         # [B, C, t, V] or None
         target_vehicle_mask=None,  # [B, V] or None
         history_vehicle_mask=None, # [B, V] or None
+        context_agent_mask=None,   # [B, V], derived only from observable context
+        history_timestep_mask=None,# [B, T_hist, V]
+        scene_stats=None,          # [B, 3] = center_x, center_y, position_scale
+        static_dimensions=None,    # [B, 2, V] = length, width
         B_hint=None,
         V_hint=None
     ):
@@ -1481,7 +1786,9 @@ class ContextEncoder(nn.Module):
             raise RuntimeError("ContextEncoder cannot infer (B,V). Provide history/labels/types/mask or pass B_hint,V_hint.")
 
         # ---------- agent 有效性 (用于嵌入 mask) ----------
-        if target_vehicle_mask is not None:
+        if context_agent_mask is not None:
+            agent_valid_mask = context_agent_mask.to(device).bool()
+        elif target_vehicle_mask is not None:
             agent_valid_mask = target_vehicle_mask.to(device).bool()
         elif history_vehicle_mask is not None:
             agent_valid_mask = history_vehicle_mask.to(device).bool()
@@ -1492,9 +1799,35 @@ class ContextEncoder(nn.Module):
 
         label_emb = self.label_embed(condition) if condition is not None else None
         type_emb = self.agent_types_embed(agent_types) if agent_types is not None else None
+
+        extra_emb = None
+        if scene_stats is not None:
+            if tuple(scene_stats.shape) != (B, 3):
+                raise ValueError(f"scene_stats must be [B,3], got {tuple(scene_stats.shape)}")
+            stats = scene_stats.to(device=device, dtype=dtype)
+            # Bound global coordinates and expose scale logarithmically.  The
+            # latter is the physically relevant quantity for normalised motion.
+            stats_features = torch.stack([
+                torch.tanh(stats[:, 0] / 1000.0),
+                torch.tanh(stats[:, 1] / 1000.0),
+                torch.log(stats[:, 2].abs().clamp_min(1e-6)) / 5.0,
+            ], dim=-1)
+            extra_emb = self.scene_stats_encoder(stats_features).unsqueeze(1).expand(B, V, -1)
+
+        if static_dimensions is not None:
+            if tuple(static_dimensions.shape) != (B, 2, V):
+                raise ValueError(
+                    f"static_dimensions must be [B,2,V], got {tuple(static_dimensions.shape)}"
+                )
+            dimensions = static_dimensions.to(device=device, dtype=dtype).permute(0, 2, 1)
+            dimensions_emb = self.static_dimensions_encoder(dimensions)
+            extra_emb = dimensions_emb if extra_emb is None else extra_emb + dimensions_emb
+
         agent_anchor_xy, agent_anchor_valid, hist_timestep_mask, last_hist_idx = self._extract_agent_anchor(
-            history_data, history_vehicle_mask, agent_valid_mask
+            history_data, history_vehicle_mask, agent_valid_mask,
+            history_timestep_mask=history_timestep_mask,
         )
+        agent_rope_xy = self._metric_rope_anchor(agent_anchor_xy, scene_stats)
 
         # ---------- 2) 历史特征 (per-agent: [B*V, T_hist, F]) ----------
         history_tokens = None
@@ -1534,7 +1867,9 @@ class ContextEncoder(nn.Module):
             L = lane_feat_shared.shape[1]
             lane_valid_L = map_mask.any(dim=-1)
             scene_token = self._pool_scene_token(lane_feat_shared, lane_valid_L)
-            agent_query_tokens = self._build_agent_queries(type_emb, label_emb, agent_valid_mask, scene_token)
+            agent_query_tokens = self._build_agent_queries(
+                type_emb, label_emb, agent_valid_mask, scene_token, extra_emb=extra_emb
+            )
             
             # 如果 history_data 缺失（Unconditional/Cold Start），不要做 TopK 裁剪，
             # 直接为每个 agent 提供全量地图上下文，避免在全图生成场景里过早丢失候选车道。
@@ -1550,7 +1885,9 @@ class ContextEncoder(nn.Module):
                     lane_feat_shared, map_data, map_mask, agent_valid_mask
                 )
         else:
-            agent_query_tokens = self._build_agent_queries(type_emb, label_emb, agent_valid_mask, scene_token=None)
+            agent_query_tokens = self._build_agent_queries(
+                type_emb, label_emb, agent_valid_mask, scene_token=None, extra_emb=extra_emb
+            )
 
         # ---------- 4) 互相增强 (history ↔ map)，per-agent 形式 ----------
         lane_compliance_score = None
@@ -1612,6 +1949,10 @@ class ContextEncoder(nn.Module):
             "kv_mask": kv_mask,
             "B": B,
             "V": V,
+            "agent_valid_mask": agent_valid_mask,
+            "agent_anchor_xy": agent_anchor_xy,
+            "agent_rope_xy": agent_rope_xy,
+            "agent_anchor_valid": agent_anchor_valid,
             "lane_compliance_score": lane_compliance_score  # 新增：可用于辅助loss
         }
         return context
@@ -1630,7 +1971,14 @@ class AffineCoupling(nn.Module):
         
         # Main feature extractor for in_a
         self.spatiotemporal_extractor = UnifiedSpatioTemporalExtractor(
-            input_dim=in_channel // 2, filter_size=filter_size, num_heads=8, num_layers=1, causal=True
+            input_dim=in_channel // 2,
+            filter_size=filter_size,
+            num_heads=8,
+            num_layers=1,
+            causal=True,
+            # `in_a` is a latent tensor after squeeze, ActNorm and dense channel
+            # mixing.  Its channels are not physical x/y coordinates.
+            use_input_coordinates=False,
         )
         self.scene_linear = nn.Linear(filter_size, filter_size)
         
@@ -1678,10 +2026,20 @@ class AffineCoupling(nn.Module):
             st_timestep_mask = timestep_mask.any(dim=1)  # [B, T, V]
         
         # Extract features from in_a
+        # RoPE coordinates must be exogenous to preserve both their physical
+        # meaning and the triangular coupling Jacobian.  History anchors are
+        # fixed across target time; when history is unavailable the extractor
+        # safely falls back to zero-coordinate (ordinary) attention.
+        spatial_coords = (
+            context.get("agent_rope_xy", context.get("agent_anchor_xy", None))
+            if context is not None
+            else None
+        )
         main_feat = self.spatiotemporal_extractor(
             extractor_input,
             vehicle_mask,
             timestep_mask=st_timestep_mask,
+            spatial_coords=spatial_coords,
         )  # [B,V,T,F]
         scene_emb = self.scene_linear(main_feat)  # [B,V,T,F]
         scene_emb = scene_emb * vehicle_mask.unsqueeze(-1).unsqueeze(-1).float()
@@ -1742,7 +2100,9 @@ class AffineCoupling(nn.Module):
         in_a, in_b = input.chunk(2, dim=1)
         
         # Get vehicle mask
-        if target_vehicle_mask is not None:
+        if context is not None and context.get("agent_valid_mask", None) is not None:
+            vehicle_mask = context["agent_valid_mask"]
+        elif target_vehicle_mask is not None:
             vehicle_mask = target_vehicle_mask
         elif history_data is not None:
             vehicle_mask = (history_data.abs().sum(dim=(1, 2)) > 1e-6)
@@ -1783,7 +2143,9 @@ class AffineCoupling(nn.Module):
         out_a, out_b = output.chunk(2, dim=1)
         
         # Get vehicle mask
-        if target_vehicle_mask is not None:
+        if context is not None and context.get("agent_valid_mask", None) is not None:
+            vehicle_mask = context["agent_valid_mask"]
+        elif target_vehicle_mask is not None:
             vehicle_mask = target_vehicle_mask
         elif history_data is not None:
             vehicle_mask = (history_data.abs().sum(dim=(1, 2)) > 1e-6)
@@ -1821,7 +2183,7 @@ class Flow(nn.Module):
     def __init__(self, in_channel, condition_dim, affine=True, conv_lu=True):
         super().__init__()
         self.actnorm = ActNorm(in_channel)
-        self.invconv = InvConv2d(in_channel)
+        self.invconv = InvConv2d(in_channel, lu=conv_lu)
         self.coupling = AffineCoupling(in_channel, condition_dim, affine=affine)
 
     def forward(self, input, condition=None, map_data=None, map_mask=None, agent_types=None, 
@@ -1887,8 +2249,10 @@ class Block(nn.Module):
         unsqueezed = unsqueezed.contiguous().view(b_size, n_channel // 2, height * 2, width)
         return unsqueezed
 
-    def forward(self, input, condition=None, map_data=None, map_mask=None, agent_types=None, 
-                history_data=None, target_vehicle_mask=None, history_vehicle_mask=None, timestep_mask=None):
+    def forward(self, input, condition=None, map_data=None, map_mask=None, agent_types=None,
+                history_data=None, target_vehicle_mask=None, history_vehicle_mask=None,
+                timestep_mask=None, context_agent_mask=None, history_timestep_mask=None,
+                scene_stats=None, static_dimensions=None):
         """
         Args:
             timestep_mask: [B,T,V] for the first block or an exact [B,C,T,V]
@@ -1918,6 +2282,10 @@ class Block(nn.Module):
             history_data=history_data,
             target_vehicle_mask=target_vehicle_mask,
             history_vehicle_mask=history_vehicle_mask,
+            context_agent_mask=context_agent_mask,
+            history_timestep_mask=history_timestep_mask,
+            scene_stats=scene_stats,
+            static_dimensions=static_dimensions,
             B_hint=b_size, V_hint=width
         )
 
@@ -1956,7 +2324,9 @@ class Block(nn.Module):
 
     def reverse(self, output, condition=None, map_data=None, map_mask=None, agent_types=None,
                 eps=None, history_data=None, reconstruct=False, target_vehicle_mask=None,
-                history_vehicle_mask=None, guidance_scale=1.0, timestep_mask=None):
+                history_vehicle_mask=None, guidance_scale=1.0, timestep_mask=None,
+                context_agent_mask=None, history_timestep_mask=None,
+                scene_stats=None, static_dimensions=None):
         """
         Reverse pass for sampling.
         
@@ -2017,6 +2387,10 @@ class Block(nn.Module):
             history_data=history_data,
             target_vehicle_mask=target_vehicle_mask,
             history_vehicle_mask=history_vehicle_mask,
+            context_agent_mask=context_agent_mask,
+            history_timestep_mask=history_timestep_mask,
+            scene_stats=scene_stats,
+            static_dimensions=static_dimensions,
             B_hint=b_size, V_hint=width                 # <- NEW
         )
         guidance_context = None
@@ -2027,6 +2401,10 @@ class Block(nn.Module):
                 history_data=history_data,
                 target_vehicle_mask=target_vehicle_mask,
                 history_vehicle_mask=history_vehicle_mask,
+                context_agent_mask=context_agent_mask,
+                history_timestep_mask=history_timestep_mask,
+                scene_stats=scene_stats,
+                static_dimensions=static_dimensions,
                 B_hint=b_size, V_hint=width
             )
 
@@ -2043,9 +2421,11 @@ class Block(nn.Module):
 
 
 class Glow(nn.Module):
-    def __init__(self, in_channel, condition_dim, n_flow, n_block, affine=True, conv_lu=True):
+    def __init__(self, in_channel, condition_dim, n_flow, n_block, affine=True,
+                 conv_lu=True, history_input_dim=None):
         super().__init__()
         self.in_channel = int(in_channel)
+        history_input_dim = self.in_channel if history_input_dim is None else int(history_input_dim)
         self.blocks = nn.ModuleList()
         n_channel = in_channel
         for i in range(n_block - 1):
@@ -2056,7 +2436,7 @@ class Glow(nn.Module):
                     n_flow,
                     affine=affine,
                     conv_lu=conv_lu,
-                    history_input_dim=in_channel,
+                    history_input_dim=history_input_dim,
                 )
             )
             # n_channel *= 2
@@ -2067,12 +2447,15 @@ class Glow(nn.Module):
                 n_flow,
                 split=False,
                 affine=affine,
-                history_input_dim=in_channel,
+                conv_lu=conv_lu,
+                history_input_dim=history_input_dim,
             )
         )
 
-    def forward(self, input, condition=None, map_data=None, map_mask=None, agent_types=None, 
-                history_data=None, target_vehicle_mask=None, history_vehicle_mask=None, timestep_mask=None):
+    def forward(self, input, condition=None, map_data=None, map_mask=None, agent_types=None,
+                history_data=None, target_vehicle_mask=None, history_vehicle_mask=None,
+                timestep_mask=None, context_agent_mask=None, history_timestep_mask=None,
+                scene_stats=None, static_dimensions=None):
         """
         Args:
             input: [B, C, T, V] trajectory data
@@ -2099,7 +2482,11 @@ class Glow(nn.Module):
         for block in self.blocks:
             out, det, log_p, z_new, current_mask = block(
                 out, condition, map_data, map_mask, agent_types, history_data, 
-                target_vehicle_mask, history_vehicle_mask, timestep_mask=current_mask
+                target_vehicle_mask, history_vehicle_mask, timestep_mask=current_mask,
+                context_agent_mask=context_agent_mask,
+                history_timestep_mask=history_timestep_mask,
+                scene_stats=scene_stats,
+                static_dimensions=static_dimensions,
             )
             z_outs.append(z_new)
             logdet = logdet + det
@@ -2110,7 +2497,9 @@ class Glow(nn.Module):
 
     def reverse(self, z_list, condition=None, map_data=None, map_mask=None, agent_types=None,
                 history_data=None, reconstruct=False, target_vehicle_mask=None,
-                history_vehicle_mask=None, timestep_mask=None, guidance_scale=1.0):
+                history_vehicle_mask=None, timestep_mask=None, guidance_scale=1.0,
+                context_agent_mask=None, history_timestep_mask=None,
+                scene_stats=None, static_dimensions=None):
         """
         Reverse pass for sampling.
         
@@ -2161,6 +2550,10 @@ class Glow(nn.Module):
                     history_vehicle_mask=history_vehicle_mask,
                     guidance_scale=guidance_scale,
                     timestep_mask=block_mask,
+                    context_agent_mask=context_agent_mask,
+                    history_timestep_mask=history_timestep_mask,
+                    scene_stats=scene_stats,
+                    static_dimensions=static_dimensions,
                 )
             else:
                 input = block.reverse(
@@ -2176,6 +2569,10 @@ class Glow(nn.Module):
                     history_vehicle_mask=history_vehicle_mask,
                     guidance_scale=guidance_scale,
                     timestep_mask=block_mask,
+                    context_agent_mask=context_agent_mask,
+                    history_timestep_mask=history_timestep_mask,
+                    scene_stats=scene_stats,
+                    static_dimensions=static_dimensions,
                 )
 
         if timestep_mask is not None:

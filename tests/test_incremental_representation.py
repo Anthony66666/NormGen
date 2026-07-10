@@ -72,6 +72,7 @@ class IncrementalRepresentationTest(unittest.TestCase):
         trajectories[0, 0, :, 0] = np.arange(40, dtype=np.float32) / 10.0
         trajectories[0, 2, :, 0] = 0.1
         dimensions = np.ones((1, 2, 40, 1), dtype=np.float32)
+        timestep_mask = np.ones((1, 40, 1), dtype=bool)
         scene_stats = np.asarray(
             [{"mean": np.zeros(2, dtype=np.float32), "scale": np.float32(1.0)}],
             dtype=object,
@@ -83,6 +84,11 @@ class IncrementalRepresentationTest(unittest.TestCase):
                 path,
                 trajectories=trajectories,
                 dimensions=dimensions,
+                timestep_mask=timestep_mask,
+                history_timestep_mask=timestep_mask[:, :10],
+                future_timestep_mask=timestep_mask[:, 10:],
+                context_agent_mask=np.ones((1, 1), dtype=bool),
+                forecasting_safe=np.bool_(True),
                 labels=np.zeros((1, 1), dtype=np.int64),
                 agent_types=np.zeros((1, 1), dtype=np.int64),
                 map_data=np.zeros((1, 1, 2, 2), dtype=np.float32),
@@ -104,7 +110,7 @@ class IncrementalRepresentationTest(unittest.TestCase):
             )
 
         self.assertEqual(tuple(dataset.target_data.shape), (1, 5, 30, 1))
-        self.assertTrue(dataset.target_timestep_mask.all())
+        self.assertTrue(dataset.loss_timestep_mask.all())
         np.testing.assert_allclose(
             dataset.target_data[0, 0, :, 0].numpy(),
             np.full(30, 0.1, dtype=np.float32),

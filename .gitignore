@@ -10,6 +10,7 @@ __pycache__/
 *.log
 
 data/
+artifacts/
 results/
 runs/
 checkpoints/
