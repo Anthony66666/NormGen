@@ -91,9 +91,9 @@ def gaussian_log_p(x, mean, log_sd, mask=None):
     log_p_elem = -0.5 * log(2 * pi) - log_sd - 0.5 * diff_sq / var
     
     if mask is not None:
-        # mask: True = valid, False = padding (ignore)
-        # Ensure mask has same shape or is broadcastable
-        log_p_elem = log_p_elem * mask.float()
+        # torch.where avoids propagating NaN from an invalid position through
+        # the otherwise tempting NaN * 0 masking pattern.
+        log_p_elem = torch.where(mask.bool(), log_p_elem, torch.zeros_like(log_p_elem))
     
     return log_p_elem
 
@@ -141,18 +141,49 @@ def create_squeezed_mask(timestep_mask, squeeze_factor=2):
         squeezed_mask: [B, C_squeezed, T_squeezed, V] bool
             其中 C_squeezed = squeeze_factor, T_squeezed = T // squeeze_factor
     """
-    B, T, V = timestep_mask.shape
+    if timestep_mask.dim() != 3:
+        raise ValueError(f"timestep_mask must be [B,T,V], got {tuple(timestep_mask.shape)}")
+    return squeeze_channel_mask(timestep_mask.unsqueeze(1), squeeze_factor=squeeze_factor)
+
+
+def ensure_channel_mask(mask, channels, time_steps=None, agents=None):
+    """Return an exact per-channel validity mask shaped [B,C,T,V]."""
+    if mask.dim() == 3:
+        channel_mask = mask.unsqueeze(1).expand(-1, int(channels), -1, -1)
+    elif mask.dim() == 4:
+        if mask.shape[1] != int(channels):
+            raise ValueError(
+                f"channel mask has {mask.shape[1]} channels, expected {int(channels)}"
+            )
+        channel_mask = mask
+    else:
+        raise ValueError(f"mask must be [B,T,V] or [B,C,T,V], got {tuple(mask.shape)}")
+
+    if time_steps is not None and channel_mask.shape[2] != int(time_steps):
+        raise ValueError(
+            f"mask has {channel_mask.shape[2]} timesteps, expected {int(time_steps)}"
+        )
+    if agents is not None and channel_mask.shape[3] != int(agents):
+        raise ValueError(f"mask has {channel_mask.shape[3]} agents, expected {int(agents)}")
+    return channel_mask.bool()
+
+
+def squeeze_channel_mask(channel_mask, squeeze_factor=2):
+    """Apply the same time-to-channel permutation used by a Glow squeeze."""
+    if channel_mask.dim() != 4:
+        raise ValueError(
+            f"channel_mask must be [B,C,T,V], got {tuple(channel_mask.shape)}"
+        )
+    B, C, T, V = channel_mask.shape
     if T % squeeze_factor != 0:
         raise ValueError(f"timestep length {T} is not divisible by squeeze_factor {squeeze_factor}")
     T_squeezed = T // squeeze_factor
-    
-    # Reshape: [B, T, V] -> [B, T_squeezed, squeeze_factor, V]
-    mask_reshaped = timestep_mask.view(B, T_squeezed, squeeze_factor, V)
-
-    # Squeeze 会把相邻时间步搬到通道维度，因此 mask 也必须逐子时间步保留。
-    squeezed_mask = mask_reshaped.permute(0, 2, 1, 3).contiguous()  # [B, squeeze_factor, T/2, V]
-
-    return squeezed_mask
+    mask_reshaped = channel_mask.view(B, C, T_squeezed, squeeze_factor, V)
+    return (
+        mask_reshaped.permute(0, 1, 3, 2, 4)
+        .contiguous()
+        .view(B, C * squeeze_factor, T_squeezed, V)
+    )
 
 
 # ------------------------- ActNorm -------------------------
@@ -1631,14 +1662,27 @@ class AffineCoupling(nn.Module):
         """
         B, C_half, T, V = in_a.shape
         
-        # Convert squeezed mask to [B, T, V] for spatiotemporal extractor
+        # Keep invalid squeezed channels out of the conditioner. A single
+        # timestep can contain a mixture of real and padded substeps after
+        # squeezing, especially with an odd input channel count.
         st_timestep_mask = None
+        extractor_input = in_a
         if timestep_mask is not None:
-            # timestep_mask: [B, C, T, V] -> take first channel or any channel
-            st_timestep_mask = timestep_mask[:, 0, :, :]  # [B, T, V]
+            if timestep_mask.dim() != 4 or timestep_mask.shape[1] != C_half * 2:
+                raise ValueError(
+                    "AffineCoupling expects a [B,C,T,V] mask matching its full input; "
+                    f"got {tuple(timestep_mask.shape)} for {C_half * 2} channels"
+                )
+            mask_a = timestep_mask[:, :C_half, :, :]
+            extractor_input = torch.where(mask_a, in_a, torch.zeros_like(in_a))
+            st_timestep_mask = timestep_mask.any(dim=1)  # [B, T, V]
         
         # Extract features from in_a
-        main_feat = self.spatiotemporal_extractor(in_a, vehicle_mask, timestep_mask=st_timestep_mask)  # [B,V,T,F]
+        main_feat = self.spatiotemporal_extractor(
+            extractor_input,
+            vehicle_mask,
+            timestep_mask=st_timestep_mask,
+        )  # [B,V,T,F]
         scene_emb = self.scene_linear(main_feat)  # [B,V,T,F]
         scene_emb = scene_emb * vehicle_mask.unsqueeze(-1).unsqueeze(-1).float()
         # Per-agent 结构: [B*V, T, F]
@@ -1847,21 +1891,26 @@ class Block(nn.Module):
                 history_data=None, target_vehicle_mask=None, history_vehicle_mask=None, timestep_mask=None):
         """
         Args:
-            timestep_mask: [B, T, V] bool, True = valid. Will be converted to squeezed form.
+            timestep_mask: [B,T,V] for the first block or an exact [B,C,T,V]
+                channel mask from the preceding block.
         """
         b_size, n_channel, height, width = input.shape
 
         out = self._squeeze_time2(input)  # [B, 2C, T/2, V]
-        b_size, squeezed_c, squeezed_t, width = out.shape
+        b_size, _, _, width = out.shape
         
-        # Convert timestep_mask to squeezed form
+        # Apply the identical time-to-channel permutation to the mask. Do not
+        # collapse it back with any/all: after a split, output channels can
+        # represent different original timesteps.
         squeezed_mask = None
         if timestep_mask is not None:
-            # timestep_mask: [B, T, V] -> squeezed_mask: [B, 2C, T/2, V]
-            squeezed_mask = create_squeezed_mask(timestep_mask, squeeze_factor=2)
-            # 扩展通道维度以匹配 squeezed 后的通道数
-            # squeezed_mask 目前是 [B, 2, T/2, V]，需要扩展到 [B, 2*n_channel, T/2, V]
-            squeezed_mask = squeezed_mask.repeat(1, n_channel, 1, 1)  # [B, 2C, T/2, V]
+            input_mask = ensure_channel_mask(
+                timestep_mask,
+                n_channel,
+                time_steps=height,
+                agents=width,
+            )
+            squeezed_mask = squeeze_channel_mask(input_mask, squeeze_factor=2)
 
         context = self.context_encoder(
             condition=condition, agent_types=agent_types,
@@ -1882,18 +1931,28 @@ class Block(nn.Module):
 
         if self.split:
             out, z_new = out.chunk(2, 1)
-            mean, log_sd = self.prior(out).chunk(2, 1)
-            # 计算 log_p 时使用 mask
-            log_p_elem = gaussian_log_p(z_new, mean, log_sd, mask=squeezed_mask[:, :squeezed_c//2] if squeezed_mask is not None else None)
+            out_mask, z_mask = (
+                squeezed_mask.chunk(2, 1)
+                if squeezed_mask is not None
+                else (None, None)
+            )
+            prior_input = (
+                torch.where(out_mask, out, torch.zeros_like(out))
+                if out_mask is not None
+                else out
+            )
+            mean, log_sd = self.prior(prior_input).chunk(2, 1)
+            log_p_elem = gaussian_log_p(z_new, mean, log_sd, mask=z_mask)
             log_p = log_p_elem.view(b_size, -1).sum(1)
         else:
+            out_mask = squeezed_mask
             zero = torch.zeros_like(out)
             mean, log_sd = self.prior(zero).chunk(2, 1)
             log_p_elem = gaussian_log_p(out, mean, log_sd, mask=squeezed_mask if squeezed_mask is not None else None)
             log_p = log_p_elem.view(b_size, -1).sum(1)
             z_new = out
         
-        return out, logdet, log_p, z_new
+        return out, logdet, log_p, z_new, out_mask
 
     def reverse(self, output, condition=None, map_data=None, map_mask=None, agent_types=None,
                 eps=None, history_data=None, reconstruct=False, target_vehicle_mask=None,
@@ -1902,10 +1961,25 @@ class Block(nn.Module):
         Reverse pass for sampling.
         
         Args:
-            timestep_mask: [B, T, V] bool (original resolution), True = valid.
-                          Will be downsampled for squeezed domain.
+            timestep_mask: [B,T,V] or exact [B,C,T,V] mask at this block's
+                input resolution.
         """
         input = output
+        width = output.shape[-1]
+        squeezed_mask = None
+        out_mask = None
+        if timestep_mask is not None:
+            n_channel = output.shape[1] if self.split else output.shape[1] // 2
+            input_mask = ensure_channel_mask(
+                timestep_mask,
+                n_channel,
+                time_steps=output.shape[2] * 2,
+                agents=width,
+            )
+            squeezed_mask = squeeze_channel_mask(input_mask, squeeze_factor=2)
+            if self.split:
+                out_mask, _ = squeezed_mask.chunk(2, 1)
+
         if reconstruct:
             if self.split:
                 input = torch.cat([output, eps], 1)
@@ -1913,7 +1987,12 @@ class Block(nn.Module):
                 input = eps
         else:
             if self.split:
-                mean, log_sd = self.prior(input).chunk(2, 1)
+                prior_input = (
+                    torch.where(out_mask, input, torch.zeros_like(input))
+                    if out_mask is not None
+                    else input
+                )
+                mean, log_sd = self.prior(prior_input).chunk(2, 1)
                 z = gaussian_sample(eps, mean, log_sd)
                 input = torch.cat([output, z], 1)
             else:
@@ -1930,7 +2009,7 @@ class Block(nn.Module):
         #     target_vehicle_mask=target_vehicle_mask,
         #     history_vehicle_mask=history_vehicle_mask
         # )
-        b_size, _, _, width = input.shape  # input 此时已是 squeeze 域
+        b_size = input.shape[0]
 
         context = self.context_encoder(
             condition=condition, agent_types=agent_types,
@@ -1951,19 +2030,6 @@ class Block(nn.Module):
                 B_hint=b_size, V_hint=width
             )
 
-        # Prepare squeezed timestep_mask for flow.reverse if needed
-        # Note: Flow.reverse currently doesn't use timestep_mask for computation,
-        # but we pass it for potential future use or consistency
-        squeezed_mask = None
-        if timestep_mask is not None:
-            B_m, T_m, V_m = timestep_mask.shape
-            T_squeezed = T_m // 2
-            if T_squeezed > 0:
-                squeezed_mask = create_squeezed_mask(timestep_mask, squeeze_factor=2)
-                # squeezed_mask: [B, 2, T/2, V] -> repeat to match channel count
-                n_channel = input.shape[1] // 2  # original channel count before squeeze
-                squeezed_mask = squeezed_mask.repeat(1, n_channel, 1, 1)  # [B, 2C, T/2, V]
-
         for flow in self.flows[::-1]:
             input = flow.reverse(
                 input, condition, map_data, map_mask, agent_types, history_data,
@@ -1979,6 +2045,7 @@ class Block(nn.Module):
 class Glow(nn.Module):
     def __init__(self, in_channel, condition_dim, n_flow, n_block, affine=True, conv_lu=True):
         super().__init__()
+        self.in_channel = int(in_channel)
         self.blocks = nn.ModuleList()
         n_channel = in_channel
         for i in range(n_block - 1):
@@ -2022,10 +2089,15 @@ class Glow(nn.Module):
         if timestep_mask is None:
             timestep_mask = create_timestep_mask(input, padding_value=-1.0)
         
-        current_mask = timestep_mask  # [B, T, V]
+        current_mask = ensure_channel_mask(
+            timestep_mask,
+            input.shape[1],
+            time_steps=input.shape[2],
+            agents=input.shape[3],
+        )
         
         for block in self.blocks:
-            out, det, log_p, z_new = block(
+            out, det, log_p, z_new, current_mask = block(
                 out, condition, map_data, map_mask, agent_types, history_data, 
                 target_vehicle_mask, history_vehicle_mask, timestep_mask=current_mask
             )
@@ -2034,13 +2106,6 @@ class Glow(nn.Module):
             if log_p is not None:
                 log_p_sum = log_p_sum + log_p
             
-            # Update mask for next block (after squeeze, T becomes T/2)
-            if current_mask is not None:
-                B_m, T_m, V_m = current_mask.shape
-                if T_m >= 2:
-                    # Downsample mask: [B, T, V] -> [B, T/2, V]
-                    current_mask = current_mask.view(B_m, T_m // 2, 2, V_m).any(dim=2)
-        
         return log_p_sum, logdet, z_outs
 
     def reverse(self, z_list, condition=None, map_data=None, map_mask=None, agent_types=None,
@@ -2055,19 +2120,23 @@ class Glow(nn.Module):
         """
         n_block = len(self.blocks)
         
-        # 预计算每个 block 对应的 downsampled timestep_mask
-        # block 0 对应原始分辨率，block 1 对应 T/2，block 2 对应 T/4，...
-        # reverse 时从最后一个 block 开始，所以需要反向的 mask 列表
+        # Reproduce the exact per-channel mask carried by each forward block.
         mask_list = []
         if timestep_mask is not None:
-            current_mask = timestep_mask
-            for _ in range(n_block):
+            current_mask = ensure_channel_mask(
+                timestep_mask,
+                self.in_channel,
+                time_steps=timestep_mask.shape[-2],
+                agents=timestep_mask.shape[-1],
+            )
+            for block in self.blocks:
                 mask_list.append(current_mask)
-                B_m, T_m, V_m = current_mask.shape
-                if T_m >= 2:
-                    # Downsample: [B, T, V] -> [B, T/2, V]
-                    current_mask = current_mask.view(B_m, T_m // 2, 2, V_m).any(dim=2)
-                # 如果 T < 2，保持原样
+                squeezed_mask = squeeze_channel_mask(current_mask, squeeze_factor=2)
+                current_mask = (
+                    squeezed_mask.chunk(2, 1)[0]
+                    if block.split
+                    else squeezed_mask
+                )
         
         for i, block in enumerate(self.blocks[::-1]):
             # 获取当前 block 对应的 mask（reverse 顺序：最后一个 block 用最小分辨率的 mask）
@@ -2110,7 +2179,13 @@ class Glow(nn.Module):
                 )
 
         if timestep_mask is not None:
-            input = input.masked_fill(~timestep_mask.unsqueeze(1), -1.0)
+            output_mask = ensure_channel_mask(
+                timestep_mask,
+                input.shape[1],
+                time_steps=input.shape[2],
+                agents=input.shape[3],
+            )
+            input = input.masked_fill(~output_mask, -1.0)
         elif target_vehicle_mask is not None:
             input = input.masked_fill(~target_vehicle_mask.unsqueeze(1).unsqueeze(1), -1.0)
 

@@ -12,7 +12,7 @@ n_block: 3
 no_lu: false
 affine: true
 
-lr: 0.0001
+lr: 0.00005
 img_size_h: -1
 img_size_w: -1
 in_channel: 7
@@ -30,9 +30,9 @@ temp_block_decay: 1.0
 cfg_scale: 1.0
 n_modes: 6
 
-num_workers: 4
+num_workers: 0
 worker_start_method: ""
-persistent_workers: true
+persistent_workers: false
 prefetch_factor: 2
 sample_interval: 2000
 save_interval: 2000
@@ -56,9 +56,9 @@ resume_model_only: false
 no_resume_iter: false
 save_step_checkpoints: false
 keep_legacy_checkpoints: true
-loss_normalize: scene
+loss_normalize: valid_dim
 
-amp: true
+amp: false
 compile: false
 seed: 42
 deterministic: false

@@ -458,6 +458,20 @@ def sample_latents(batch_size, z_shapes, device, base_temp, block_decay=1.0):
     return [torch.randn(batch_size, *z, device=device) * temps[idx] for idx, z in enumerate(z_shapes)]
 
 
+def crop_time_steps(array, steps, axis):
+    """Return exactly the requested leading timesteps along ``axis``."""
+    steps = int(steps)
+    axis = int(axis) % array.ndim
+    available = int(array.shape[axis])
+    if steps <= 0:
+        raise ValueError(f"steps must be positive, got {steps}")
+    if available < steps:
+        raise ValueError(f"cannot crop {steps} timesteps from axis length {available}")
+    slices = [slice(None)] * array.ndim
+    slices[axis] = slice(0, steps)
+    return array[tuple(slices)]
+
+
 def build_map_features(map_xy, map_mask, map_type):
     """
     map_xy:   [B, L, P, 2]
@@ -709,6 +723,13 @@ def save_samples_npz(model_single, batch, args, z_shapes, device, step):
 
     conditional_samples = np.stack(conditional_samples, axis=0)
     unconditional_samples = np.stack(unconditional_samples, axis=0)
+    saved_gt = np.array(sample_gt.cpu().data)
+    saved_timestep_mask = np.array(sample_batch["timestep_mask"].cpu().data)
+    if args.train_mode == "prediction":
+        conditional_samples = crop_time_steps(conditional_samples, args.future_steps, axis=3)
+        unconditional_samples = crop_time_steps(unconditional_samples, args.future_steps, axis=3)
+        saved_gt = crop_time_steps(saved_gt, args.future_steps, axis=2)
+        saved_timestep_mask = crop_time_steps(saved_timestep_mask, args.future_steps, axis=1)
 
     out_dir = Path(args.sample_out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -716,7 +737,7 @@ def save_samples_npz(model_single, batch, args, z_shapes, device, step):
     save_dict = dict(
         conditional_samples=conditional_samples,
         unconditional_samples=unconditional_samples,
-        gt=np.array(sample_gt.cpu().data),
+        gt=saved_gt,
         labels=np.array(sample_raw_labels.cpu().data),
         model_labels=np.array(sample_labels.cpu().data),
         maps=np.array(sample_batch["map_data"].cpu().data),
@@ -728,7 +749,7 @@ def save_samples_npz(model_single, batch, args, z_shapes, device, step):
         scene_stats=np.array(sample_scene_stats.cpu().data),
         map_name=np.array(sample_map_name),
         target_vehicle_mask=np.array(sample_batch["target_vehicle_mask"].cpu().data),
-        timestep_mask=np.array(sample_batch["timestep_mask"].cpu().data),
+        timestep_mask=saved_timestep_mask,
         n_modes=args.n_modes,
         in_channel=args.in_channel,
         train_mode=np.asarray(args.train_mode),
@@ -737,6 +758,7 @@ def save_samples_npz(model_single, batch, args, z_shapes, device, step):
         history_steps=np.int64(args.history_steps),
         future_steps=np.int64(args.future_steps),
         prediction_target_steps=np.int64(args.prediction_target_steps),
+        saved_target_steps=np.int64(conditional_samples.shape[3]),
         label_source=np.asarray(args.label_source),
     )
     if args.train_mode == "prediction":
@@ -750,7 +772,7 @@ def save_samples_npz(model_single, batch, args, z_shapes, device, step):
             out_dir=out_dir,
             step=step,
             prediction_samples=unconditional_samples,
-            gt=np.array(sample_gt.cpu().data),
+            gt=saved_gt,
             history_data=(
                 np.array(sample_batch["history_data"].cpu().data)
                 if args.train_mode == "prediction" and sample_batch["history_data"] is not None
@@ -761,7 +783,7 @@ def save_samples_npz(model_single, batch, args, z_shapes, device, step):
             map_type=np.array(sample_map_type.cpu().data),
             map_name=np.array(sample_map_name),
             target_vehicle_mask=np.array(sample_batch["target_vehicle_mask"].cpu().data),
-            timestep_mask=np.array(sample_batch["timestep_mask"].cpu().data),
+            timestep_mask=saved_timestep_mask,
             args=args,
         )
 

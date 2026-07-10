@@ -87,8 +87,14 @@ bash scripts/train.sh /absolute/path/to/interaction_multi_train_combined.npz
 Prediction mode uses:
 
 - history: 10 frames
-- target: 30 future frames padded to 32 for squeeze
+- training target: 30 future frames padded internally to 32 for squeeze
+- saved samples, visualizations, and evaluation inputs: exactly the first 30 future frames
 - label condition: disabled
+
+The default prediction config is intentionally conservative for the first
+server run: float32 training, per-valid-dimension loss normalization,
+`lr=5e-5`, and a single-process DataLoader. Increase worker count or re-enable
+AMP only after a short run remains finite.
 
 Initialization mode:
 
