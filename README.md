@@ -9,6 +9,7 @@ The dataset is intentionally not included in this repository.
 - `train_combined.py`: training entrypoint for initialization and prediction modes.
 - `data_preprocess.py`: INTERACTION multi-scenario preprocessing.
 - `configs/prediction.yaml`: default future-prediction training config.
+- `configs/prediction_v2.yaml`: stronger constant-velocity residual prediction config.
 - `configs/initialization.yaml`: default full-trajectory initialization training config.
 - `scripts/train.sh`: one-command training wrapper.
 - `scripts/preprocess.sh`: preprocessing wrapper.
@@ -64,6 +65,14 @@ Run preprocessing:
 bash scripts/preprocess.sh /absolute/path/to/INTERACTION-Dataset-DR-multi-v1_2
 ```
 
+Prediction preprocessing is forecasting-safe by default: the selected agents,
+coordinate center, adaptive scale, maneuver labels, and map ranking are derived
+only from the first 10 observed frames. The archive stores explicit history,
+future, context-agent, and loss masks plus numeric normalization metadata.
+Prediction training rejects older archives without this contract unless the
+high-risk `--allow_legacy_prediction_data` override is supplied; that override
+cannot undo future leakage already baked into an old archive.
+
 By default this writes:
 
 ```text
@@ -84,11 +93,57 @@ Prediction mode is the default:
 bash scripts/train.sh /absolute/path/to/interaction_multi_train_combined.npz
 ```
 
+Use an independent validation archive with:
+
+```bash
+bash scripts/train.sh /absolute/path/to/interaction_multi_train_combined.npz \
+  --val_combined_path /absolute/path/to/interaction_multi_val_combined.npz
+```
+
 Prediction mode uses:
 
 - history: 10 frames
-- target: 30 future frames padded to 32 for squeeze
+- training target: 30 future dynamic states using the representation selected
+  by the config (`absolute`, `delta`, or recommended `cv_residual`)
+- model time dimension: 30 frames with one flow block, so prediction does not use synthetic padding
+- saved samples, visualizations, and evaluation inputs: decoded absolute future states
 - label condition: disabled
+
+### Prediction V2 (recommended for a new run)
+
+V2 models an exactly invertible, heading-aligned residual around a
+constant-velocity extrapolation from observed history. Saved predictions and
+validation metrics remain in absolute scene coordinates. The model also uses
+metre-scale dynamic RoPE coordinates, history-reachable Top-32 lane selection,
+physical relative-motion features, non-causal full-future coupling
+conditioners, and a context-conditioned base Gaussian.
+
+Start V2 from scratch because the conditional prior adds new parameters:
+
+```bash
+python train_combined.py \
+  --config configs/prediction_v2.yaml \
+  --combined_path /absolute/path/to/interaction_multi_train_combined.npz \
+  --val_combined_path /absolute/path/to/interaction_multi_val_combined.npz
+```
+
+V2 validation reports ADE/FDE, best-of-K ADE/FDE, turning-agent coverage and
+errors, plus position/velocity kinematic-consistency diagnostics. Periodic
+visualizations use a fixed validation batch and latent seed for direct
+checkpoint-to-checkpoint comparison. With `fixed_validation_samples: false`,
+each sampling event draws a shuffled batch from validation; training batches
+are never used for inference. A validation archive is therefore required when
+`sample_interval` is enabled.
+
+The default prediction config is intentionally conservative for the first
+server run: float32 training, per-valid-dimension loss normalization,
+`lr=5e-5`, and a single-process DataLoader. Increase worker count only after a
+short run remains finite. Keep AMP disabled for the first run; the primary
+validated training path is FP32.
+
+Start prediction training from a new checkpoint after switching to this config.
+The five-channel, one-block model is intentionally incompatible with older
+seven-channel, three-block prediction checkpoints.
 
 Initialization mode:
 
@@ -164,8 +219,10 @@ bash scripts/train.sh /data/interaction_multi_train_combined.npz --save_sample_i
 Outputs:
 
 - full checkpoint: `results/last.pt`
+- best validation checkpoint: `results/best.pt`
 - legacy checkpoints: `results/model_interaction_combined.pt`, `results/optim_interaction_combined.pt`
 - samples: `results/*_interaction_combined_samples.npz`
+- machine-readable metrics: `results/training_metrics.jsonl` and `results/training_summary.json`
 - TensorBoard logs: `runs/`
 
 ## Server Quick Start

@@ -1,21 +1,34 @@
-# combined_path: data/interaction_multi_train_combined.npz
+combined_path: artifacts/forecasting_safe_v5_topology/interaction_multi_train_combined.npz
+val_combined_path: artifacts/forecasting_safe_v5_topology/interaction_multi_val_combined.npz
 
-combined_path: artifacts/forecasting_safe_v4/interaction_multi_train_combined.npz
-val_combined_path: artifacts/forecasting_safe_v4/interaction_multi_val_combined.npz
+model_arch: route_mixture_glow
+route_modes: 6
+route_hidden_dim: 256
+mixture_chunk_size: 2
+proposal_loss_weight: 0.2
+route_classification_loss_weight: 0.05
+proposal_smoothness_loss_weight: 0.01
+proposal_diversity_loss_weight: 0.1
+proposal_map_compliance_loss_weight: 0.05
 
-batch: 8
+batch: 4
+val_batch: 4
 epochs: 128
-start_epoch: 0
 max_steps: -1
-iter: -1
+start_epoch: 0
 start_iter: 0
 
-n_flow: 32
+n_flow: 12
 n_block: 1
 no_lu: false
 affine: true
-
 lr: 0.0001
+grad_clip_norm: 20.0
+loss_normalize: valid_dim
+scheduler_type: cosine
+warmup_steps: 1000
+min_lr_ratio: 0.05
+
 img_size_h: -1
 img_size_w: -1
 in_channel: 5
@@ -23,8 +36,7 @@ train_mode: prediction
 history_steps: 10
 future_steps: 30
 prediction_target_steps: 30
-# prediction_representation: delta
-prediction_representation: absolute
+prediction_representation: cv_residual
 label_source: none
 allow_legacy_prediction_data: false
 turn_angle_threshold_deg: 30.0
@@ -35,28 +47,29 @@ temp: 0.7
 temp_block_decay: 1.0
 cfg_scale: 1.0
 n_modes: 6
+val_num_modes: 6
 
 num_workers: 0
 worker_start_method: ""
 persistent_workers: false
 prefetch_factor: 2
 disable_tqdm: false
+
 sample_interval: 2000
+sample_seed: 12345
+fixed_validation_samples: true
 save_interval: 2000
 save_epoch_interval: 1
-val_combined_path: ""
-val_batch: 0
 val_interval: 1
-val_num_modes: 6
 val_max_batches: -1
 
-log_dir: ./runs
-ckpt_dir: ./results
-sample_out_dir: ./results
-metrics_out_path: ""
+log_dir: artifacts/route_mixture_v5_run/runs
+ckpt_dir: artifacts/route_mixture_v5_run/checkpoints
+sample_out_dir: artifacts/route_mixture_v5_run/samples
+metrics_out_path: artifacts/route_mixture_v5_run/training_metrics.jsonl
 save_sample_images: true
 vis_num_scenes: 4
-vis_num_modes: 1
+vis_num_modes: 6
 vis_position_scale: 50.0
 vis_pad: 0.08
 vis_dpi: 180
@@ -68,13 +81,11 @@ resume_path: ""
 resume_model_only: false
 no_resume_iter: false
 save_step_checkpoints: false
-keep_legacy_checkpoints: true
+keep_legacy_checkpoints: false
 allow_partial_checkpoint: false
-loss_normalize: valid_dim
 
 amp: false
 amp_init_scale: 256.0
-grad_clip_norm: 5.0
 compile: false
 seed: 42
 deterministic: false

@@ -230,6 +230,18 @@ def select_sample_array(data, args):
     return arr
 
 
+def crop_prediction_future(samples, future_steps):
+    """Strip model-only padding before generated trajectories reach evaluation."""
+    future_steps = int(future_steps)
+    if samples.ndim != 5:
+        raise ValueError(f"Prediction samples must be [K,B,C,T,V], got {samples.shape}")
+    if future_steps <= 0 or samples.shape[3] < future_steps:
+        raise ValueError(
+            f"Cannot select {future_steps} future steps from prediction shape {samples.shape}"
+        )
+    return samples[:, :, :, :future_steps, :]
+
+
 def load_sample_npz(data, args):
     samples = select_sample_array(data, args)  # [K,B,C,T,V]
     k_modes, batch, channels, steps, agents = samples.shape
@@ -241,7 +253,12 @@ def load_sample_npz(data, args):
         if "history_data" not in data.files:
             raise ValueError("Prediction sample NPZ requires history_data.")
         history = np.asarray(data["history_data"], dtype=np.float32)
-        future = samples[:, :, :, :future_steps, :]
+        if history.shape[2] < history_steps:
+            raise ValueError(
+                f"Cannot select {history_steps} history steps from shape {history.shape}"
+            )
+        history = history[:, :, :history_steps, :]
+        future = crop_prediction_future(samples, future_steps)
         scenes = np.concatenate(
             [
                 np.broadcast_to(history[None], (k_modes, batch, history.shape[1], history_steps, agents)),
