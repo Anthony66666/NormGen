@@ -13,12 +13,15 @@ import torch
 
 from train_combined import (
     CombinedInteractionDataset,
+    build_lr_scheduler,
     build_generation_timestep_mask,
+    build_random_validation_sample_dataloader,
     capture_rng_state,
     evaluating,
     gradients_are_finite,
     load_model_state_checked,
     load_training_checkpoint,
+    next_validation_sample_batch,
     save_training_checkpoint,
     trajectory_metric_sums,
     train,
@@ -201,6 +204,69 @@ def _check_gradient_finite_gate_and_trajectory_metrics():
     assert metric["minade_sum"].item() == 0.0
     assert metric["minfde_sum"].item() == 0.0
 
+    history = torch.zeros(1, 5, 2, 1)
+    history_mask = torch.ones(1, 2, 1, dtype=torch.bool)
+    turning_target = torch.zeros(1, 5, 2, 1)
+    turning_target[:, 4, :, :] = 0.5
+    turning_samples = turning_target.unsqueeze(0).repeat(2, 1, 1, 1, 1)
+    turning_samples[0, :, 4] = 0.0
+    turn_metric = trajectory_metric_sums(
+        turning_samples,
+        turning_target,
+        mask,
+        torch.ones(1, 1, dtype=torch.bool),
+        torch.tensor([2.0]),
+        history=history,
+        history_timestep_mask=history_mask,
+        velocity_scale=torch.tensor([1.0]),
+        turn_angle_threshold_deg=30.0,
+    )
+    assert turn_metric["turn_agent_count"].item() == 1
+    assert turn_metric["turn_covered_sum"].item() == 1
+    assert turn_metric["target_kinematic_count"].item() == 1
+    assert turn_metric["sample_kinematic_count"].item() == 2
+
+
+def _check_cosine_scheduler_warms_up_and_decays():
+    parameter = torch.nn.Parameter(torch.tensor([1.0]))
+    optimizer = torch.optim.AdamW([parameter], lr=1e-3)
+    args = SimpleNamespace(
+        scheduler_type="cosine", max_steps=10, epochs=1,
+        warmup_steps=2, min_lr_ratio=0.1,
+    )
+    scheduler = build_lr_scheduler(optimizer, args, steps_per_epoch=10)
+    ratios = [optimizer.param_groups[0]["lr"] / 1e-3]
+    for _ in range(10):
+        optimizer.step()
+        scheduler.step()
+        ratios.append(optimizer.param_groups[0]["lr"] / 1e-3)
+
+    assert abs(ratios[0] - 0.5) < 1e-8
+    assert abs(ratios[1] - 1.0) < 1e-8
+    assert all(a >= b for a, b in zip(ratios[1:], ratios[2:]))
+    assert abs(ratios[-1] - 0.1) < 1e-8
+
+
+def _check_periodic_sampling_uses_validation_only():
+    fixed = (torch.tensor([101]),)
+    selected, iterator = next_validation_sample_batch(fixed, None, None)
+    assert selected is fixed
+    assert iterator is None
+
+    validation_dataset = torch.utils.data.TensorDataset(torch.arange(200, 210))
+    args = SimpleNamespace(val_batch=3, batch=2, sample_seed=17)
+    random_loader = build_random_validation_sample_dataloader(
+        validation_dataset, args
+    )
+    first, iterator = next_validation_sample_batch(None, random_loader, None)
+    second, iterator = next_validation_sample_batch(None, random_loader, iterator)
+    assert first[0].shape == (3,)
+    assert second[0].shape == (3,)
+    assert (first[0] >= 200).all() and (second[0] >= 200).all()
+
+    with unittest.TestCase().assertRaisesRegex(RuntimeError, "validation"):
+        next_validation_sample_batch(None, None, None)
+
 
 def _check_tiny_train_writes_final_best_and_machine_readable_metrics(tmp_path):
     import train_combined as training_module
@@ -242,7 +308,9 @@ def _check_tiny_train_writes_final_best_and_machine_readable_metrics(tmp_path):
         start_iter=0, start_epoch=0, epochs=1, max_steps=1, seed=1,
         ddp_find_unused_parameters=False, loss_normalize="valid_dim", label_keep_prob=0.0,
         grad_clip_norm=5.0, temp=0.1, temp_block_decay=1.0, cfg_scale=1.0,
-        n_modes=1, sample_interval=0, save_interval=0, save_epoch_interval=0,
+        n_modes=1, sample_interval=1, sample_seed=123,
+        fixed_validation_samples=False,
+        save_interval=0, save_epoch_interval=0,
         save_step_checkpoints=False, keep_legacy_checkpoints=False,
         val_interval=1, val_num_modes=1, val_max_batches=1,
         log_dir=str(tmp_path / "logs"), ckpt_dir=str(tmp_path / "ckpt"),
@@ -258,6 +326,7 @@ def _check_tiny_train_writes_final_best_and_machine_readable_metrics(tmp_path):
     checkpoint_dir = tmp_path / "ckpt"
     assert (checkpoint_dir / "last.pt").exists()
     assert (checkpoint_dir / "best.pt").exists()
+    assert (tmp_path / "samples" / "000001_interaction_combined_samples.npz").exists()
     records = [
         json.loads(line)
         for line in (checkpoint_dir / "training_metrics.jsonl").read_text().splitlines()
@@ -289,6 +358,12 @@ class TrainingReliabilityTest(unittest.TestCase):
 
     def test_gradient_finite_gate_and_trajectory_metrics(self):
         _check_gradient_finite_gate_and_trajectory_metrics()
+
+    def test_cosine_scheduler_warms_up_and_decays(self):
+        _check_cosine_scheduler_warms_up_and_decays()
+
+    def test_periodic_sampling_uses_validation_only(self):
+        _check_periodic_sampling_uses_validation_only()
 
     def test_tiny_train_writes_final_best_and_machine_readable_metrics(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -9,6 +9,7 @@ The dataset is intentionally not included in this repository.
 - `train_combined.py`: training entrypoint for initialization and prediction modes.
 - `data_preprocess.py`: INTERACTION multi-scenario preprocessing.
 - `configs/prediction.yaml`: default future-prediction training config.
+- `configs/prediction_v2.yaml`: stronger constant-velocity residual prediction config.
 - `configs/initialization.yaml`: default full-trajectory initialization training config.
 - `scripts/train.sh`: one-command training wrapper.
 - `scripts/preprocess.sh`: preprocessing wrapper.
@@ -102,17 +103,43 @@ bash scripts/train.sh /absolute/path/to/interaction_multi_train_combined.npz \
 Prediction mode uses:
 
 - history: 10 frames
-- training target: 30 future dynamic states encoded as per-step deltas from the last valid history state
+- training target: 30 future dynamic states using the representation selected
+  by the config (`absolute`, `delta`, or recommended `cv_residual`)
 - model time dimension: 30 frames with one flow block, so prediction does not use synthetic padding
 - saved samples, visualizations, and evaluation inputs: decoded absolute future states
 - label condition: disabled
 
+### Prediction V2 (recommended for a new run)
+
+V2 models an exactly invertible, heading-aligned residual around a
+constant-velocity extrapolation from observed history. Saved predictions and
+validation metrics remain in absolute scene coordinates. The model also uses
+metre-scale dynamic RoPE coordinates, history-reachable Top-32 lane selection,
+physical relative-motion features, non-causal full-future coupling
+conditioners, and a context-conditioned base Gaussian.
+
+Start V2 from scratch because the conditional prior adds new parameters:
+
+```bash
+python train_combined.py \
+  --config configs/prediction_v2.yaml \
+  --combined_path /absolute/path/to/interaction_multi_train_combined.npz \
+  --val_combined_path /absolute/path/to/interaction_multi_val_combined.npz
+```
+
+V2 validation reports ADE/FDE, best-of-K ADE/FDE, turning-agent coverage and
+errors, plus position/velocity kinematic-consistency diagnostics. Periodic
+visualizations use a fixed validation batch and latent seed for direct
+checkpoint-to-checkpoint comparison. With `fixed_validation_samples: false`,
+each sampling event draws a shuffled batch from validation; training batches
+are never used for inference. A validation archive is therefore required when
+`sample_interval` is enabled.
+
 The default prediction config is intentionally conservative for the first
 server run: float32 training, per-valid-dimension loss normalization,
 `lr=5e-5`, and a single-process DataLoader. Increase worker count only after a
-short run remains finite. Keep AMP disabled for now: the validated path is
-FP32, while the RoPE scaled-dot-product attention mask still requires an
-explicit FP16/BF16 dtype compatibility fix.
+short run remains finite. Keep AMP disabled for the first run; the primary
+validated training path is FP32.
 
 Start prediction training from a new checkpoint after switching to this config.
 The five-channel, one-block model is intentionally incompatible with older

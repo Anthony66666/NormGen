@@ -6,6 +6,7 @@ import contextlib
 import io
 import inspect
 import json
+import math
 import os
 import pickle
 import random
@@ -24,7 +25,7 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import LambdaLR, StepLR
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
@@ -44,9 +45,15 @@ try:
 except ModuleNotFoundError:
     SummaryWriter = None
 
-from MapGlow11_27_original import Glow
+from MapGlow11_27_original import Glow as OriginalGlow
+from RouteMixtureMapGlow import Glow as RouteMixtureGlow
+# Backward-compatible injection point used by lightweight integration tests and
+# external launchers that replace the original model class.
+Glow = OriginalGlow
 from trajectory_representation import (
+    decode_constant_velocity_residual_torch,
     decode_state_deltas_torch,
+    encode_constant_velocity_residual_np,
     encode_state_deltas_np,
 )
 
@@ -165,7 +172,10 @@ def wrap_to_pi_np(angle):
     return (angle + np.pi) % (2 * np.pi) - np.pi
 
 
-def infer_target_labels(target_data, target_vehicle_mask, turn_angle_threshold_deg=30.0, stationary_dist_threshold=0.0):
+def infer_target_labels(
+    target_data, target_vehicle_mask, turn_angle_threshold_deg=30.0,
+    stationary_dist_threshold=0.0, yaw_scale=np.pi,
+):
     labels = np.full(target_vehicle_mask.shape, 4, dtype=np.int64)
     turn_threshold = np.deg2rad(float(turn_angle_threshold_deg))
 
@@ -181,7 +191,7 @@ def infer_target_labels(target_data, target_vehicle_mask, turn_angle_threshold_d
                 continue
 
             xy = target_data[scene_idx, :2, valid_t, agent_idx].T
-            yaw = target_data[scene_idx, 4, valid_t, agent_idx] * np.pi
+            yaw = target_data[scene_idx, 4, valid_t, agent_idx] * float(yaw_scale)
             displacement = float(np.linalg.norm(xy[-1] - xy[0]))
             if stationary_dist_threshold > 0.0 and displacement < stationary_dist_threshold:
                 labels[scene_idx, agent_idx] = 3
@@ -371,6 +381,12 @@ def load_training_checkpoint(
 
     ckpt = torch_load_checkpoint(path, map_location="cpu", weights_only=False)
     if isinstance(ckpt, dict) and "model_state" in ckpt:
+        saved_arch = (ckpt.get("args") or {}).get("model_arch", "mapglow")
+        current_arch = getattr(unwrap_model(model), "model_arch", "mapglow")
+        if saved_arch != current_arch:
+            raise ValueError(
+                f"checkpoint architecture mismatch: saved={saved_arch}, current={current_arch}"
+            )
         missing, unexpected = load_model_state_checked(
             model, ckpt["model_state"], path, allow_partial=allow_partial
         )
@@ -431,6 +447,38 @@ def gradients_are_finite(parameters):
     )
 
 
+def build_lr_scheduler(optimizer, args, steps_per_epoch):
+    scheduler_type = getattr(args, "scheduler_type", "step")
+    if scheduler_type == "step":
+        return StepLR(optimizer, step_size=10000, gamma=0.96)
+    if scheduler_type != "cosine":
+        raise ValueError(f"unsupported scheduler_type: {scheduler_type}")
+
+    configured_max = int(getattr(args, "max_steps", -1))
+    total_steps = (
+        configured_max
+        if configured_max > 0
+        else max(1, int(args.epochs) * int(steps_per_epoch))
+    )
+    warmup_steps = min(
+        max(0, int(getattr(args, "warmup_steps", 0))),
+        max(0, total_steps - 1),
+    )
+    min_ratio = float(getattr(args, "min_lr_ratio", 0.05))
+
+    def lr_lambda(step):
+        if warmup_steps > 0 and step < warmup_steps:
+            return float(step + 1) / float(warmup_steps)
+        progress = float(step - warmup_steps) / float(
+            max(1, total_steps - warmup_steps)
+        )
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_ratio + (1.0 - min_ratio) * cosine
+
+    return LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
 class CombinedInteractionDataset(Dataset):
     def __init__(
         self,
@@ -445,6 +493,7 @@ class CombinedInteractionDataset(Dataset):
         turn_angle_threshold_deg=30.0,
         stationary_dist_threshold=0.0,
         allow_legacy_prediction_data=False,
+        require_map_topology=False,
     ):
         if in_channel not in (5, 7):
             raise ValueError(f"in_channel must be 5 or 7, got {in_channel}")
@@ -452,14 +501,18 @@ class CombinedInteractionDataset(Dataset):
             raise ValueError(f"train_mode must be initialization or prediction, got {train_mode}")
         if label_source not in ("auto", "none", "dataset", "target"):
             raise ValueError(f"label_source must be auto, none, dataset, or target, got {label_source}")
-        if prediction_representation not in ("absolute", "delta"):
+        if prediction_representation not in ("absolute", "delta", "cv_residual"):
             raise ValueError(
-                "prediction_representation must be absolute or delta, got "
+                "prediction_representation must be absolute, delta, or cv_residual, got "
                 f"{prediction_representation}"
             )
-        if train_mode == "prediction" and prediction_representation == "delta" and in_channel != 5:
+        if (
+            train_mode == "prediction"
+            and prediction_representation in ("delta", "cv_residual")
+            and in_channel != 5
+        ):
             raise ValueError(
-                "delta prediction represents the five dynamic trajectory channels; "
+                "prediction residuals represent the five dynamic trajectory channels; "
                 "use in_channel=5"
             )
 
@@ -500,9 +553,56 @@ class CombinedInteractionDataset(Dataset):
         map_mask = data["map_mask"].astype(bool)
         map_type = data["map_type"].astype(np.int64)
         map_speed_limit = data["map_speed_limit"].astype(np.float32)
+        topology_keys = (
+            "map_lanelet_id", "map_lane_subtype", "map_left_boundary_type",
+            "map_right_boundary_type", "lane_edge_index", "lane_edge_type", "lane_edge_mask",
+        )
+        missing_topology = [key for key in topology_keys if key not in data.files]
+        if require_map_topology and missing_topology:
+            data.close()
+            raise ValueError(
+                f"route_mixture_glow requires forecasting-safe v5 topology fields: {missing_topology}"
+            )
+        max_edges = int(np.asarray(data["max_lane_edges"]).item()) if "max_lane_edges" in data.files else 1
+        map_lanelet_id = data["map_lanelet_id"].astype(np.int64) if "map_lanelet_id" in data.files else np.zeros_like(map_type)
+        map_lane_subtype = data["map_lane_subtype"].astype(np.int64) if "map_lane_subtype" in data.files else np.zeros_like(map_type)
+        map_left_boundary_type = data["map_left_boundary_type"].astype(np.int64) if "map_left_boundary_type" in data.files else np.zeros_like(map_type)
+        map_right_boundary_type = data["map_right_boundary_type"].astype(np.int64) if "map_right_boundary_type" in data.files else np.zeros_like(map_type)
+        lane_edge_index = data["lane_edge_index"].astype(np.int64) if "lane_edge_index" in data.files else np.zeros((len(map_type), max_edges, 2), dtype=np.int64)
+        lane_edge_type = data["lane_edge_type"].astype(np.int64) if "lane_edge_type" in data.files else np.zeros((len(map_type), max_edges), dtype=np.int64)
+        lane_edge_mask = data["lane_edge_mask"].astype(bool) if "lane_edge_mask" in data.files else np.zeros((len(map_type), max_edges), dtype=bool)
         map_names = data["map_names"]
         num_scenes, _, sequence_steps, num_agents = trajectories.shape
         scene_stats = load_normalization_stats(data, num_scenes, combined_path)
+        velocity_scale_raw = _first_present_array(
+            data, ("normalization_velocity_scale",), np.float32
+        )
+        yaw_scale_raw = _first_present_array(
+            data, ("normalization_yaw_scale",), np.float32
+        )
+        velocity_scale = float(
+            np.asarray(velocity_scale_raw).item()
+            if velocity_scale_raw is not None else 15.0
+        )
+        yaw_scale = float(
+            np.asarray(yaw_scale_raw).item()
+            if yaw_scale_raw is not None else np.pi
+        )
+        if (
+            not np.isfinite(velocity_scale) or velocity_scale <= 0
+            or not np.isfinite(yaw_scale) or yaw_scale <= 0
+        ):
+            raise ValueError("velocity and yaw normalization scales must be finite and positive")
+        position_scale = scene_stats[:, 2].copy()
+        position_scale = np.where(position_scale > 0, position_scale, 50.0)
+        state_scales = np.stack(
+            [
+                position_scale,
+                np.full(num_scenes, velocity_scale, dtype=np.float32),
+                np.full(num_scenes, yaw_scale, dtype=np.float32),
+            ],
+            axis=1,
+        ).astype(np.float32)
 
         if in_channel == 7:
             full_data = np.concatenate([trajectories, dimensions], axis=1)
@@ -618,6 +718,15 @@ class CombinedInteractionDataset(Dataset):
                     history_data,
                     loss_timestep_mask,
                     history_timestep_mask,
+                    yaw_scale=yaw_scale,
+                )
+            elif prediction_representation == "cv_residual":
+                target_data = encode_constant_velocity_residual_np(
+                    target_data,
+                    history_data,
+                    loss_timestep_mask,
+                    history_timestep_mask,
+                    yaw_scale=yaw_scale,
                 )
         else:
             history_data = full_data[:, :, :0, :]
@@ -656,6 +765,7 @@ class CombinedInteractionDataset(Dataset):
                 target_vehicle_mask,
                 turn_angle_threshold_deg=turn_angle_threshold_deg,
                 stationary_dist_threshold=stationary_dist_threshold,
+                yaw_scale=yaw_scale,
             )
 
         self.history_data = torch.from_numpy(history_data)
@@ -666,7 +776,15 @@ class CombinedInteractionDataset(Dataset):
         self.map_mask = torch.from_numpy(map_mask)
         self.map_type = torch.from_numpy(map_type)
         self.map_speed_limit = torch.from_numpy(map_speed_limit)
+        self.map_lanelet_id = torch.from_numpy(map_lanelet_id)
+        self.map_lane_subtype = torch.from_numpy(map_lane_subtype)
+        self.map_left_boundary_type = torch.from_numpy(map_left_boundary_type)
+        self.map_right_boundary_type = torch.from_numpy(map_right_boundary_type)
+        self.lane_edge_index = torch.from_numpy(lane_edge_index)
+        self.lane_edge_type = torch.from_numpy(lane_edge_type)
+        self.lane_edge_mask = torch.from_numpy(lane_edge_mask)
         self.scene_stats = torch.from_numpy(scene_stats)
+        self.state_scales = torch.from_numpy(state_scales)
         self.target_vehicle_mask = torch.from_numpy(target_vehicle_mask)
         self.context_agent_mask = torch.from_numpy(context_agent_mask)
         self.history_vehicle_mask = torch.from_numpy(history_vehicle_mask)
@@ -734,6 +852,14 @@ class CombinedInteractionDataset(Dataset):
             self.loss_timestep_mask[idx],
             self.history_timestep_mask[idx],
             self.static_dimensions[idx],
+            self.state_scales[idx],
+            self.map_lanelet_id[idx],
+            self.map_lane_subtype[idx],
+            self.map_left_boundary_type[idx],
+            self.map_right_boundary_type[idx],
+            self.lane_edge_index[idx],
+            self.lane_edge_type[idx],
+            self.lane_edge_mask[idx],
         )
 
 
@@ -871,6 +997,7 @@ def build_dataloader(
         turn_angle_threshold_deg=args.turn_angle_threshold_deg,
         stationary_dist_threshold=args.stationary_dist_threshold,
         allow_legacy_prediction_data=getattr(args, "allow_legacy_prediction_data", False),
+        require_map_topology=getattr(args, "model_arch", "mapglow") == "route_mixture_glow",
     )
 
     dataloader_kwargs = {
@@ -911,6 +1038,51 @@ def build_dataloader(
     return dataloader, sampler, dataset
 
 
+def build_random_validation_sample_dataloader(dataset, args):
+    """Build a rank-local shuffled validation loader for periodic inference.
+
+    Only the main rank consumes this loader. It shares the already-loaded
+    validation dataset and uses a dedicated RNG, so choosing visualization
+    scenes neither reads the training loader nor perturbs training shuffling.
+    """
+    generator = torch.Generator()
+    sample_seed = int(getattr(args, "sample_seed", 12345))
+    if sample_seed >= 0:
+        generator.manual_seed(sample_seed + 1)
+    else:
+        generator.seed()
+    return DataLoader(
+        dataset,
+        batch_size=args.val_batch if args.val_batch > 0 else args.batch,
+        shuffle=True,
+        generator=generator,
+        num_workers=0,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
+    )
+
+
+def next_validation_sample_batch(
+    fixed_batch, random_dataloader, random_iterator
+):
+    """Return a validation batch and the reusable random-loader iterator."""
+    if fixed_batch is not None:
+        return fixed_batch, random_iterator
+    if random_dataloader is None:
+        raise RuntimeError(
+            "periodic inference requires a validation dataset via val_combined_path; "
+            "training batches are never used for sampling"
+        )
+    if random_iterator is None:
+        random_iterator = iter(random_dataloader)
+    try:
+        batch = next(random_iterator)
+    except StopIteration:
+        random_iterator = iter(random_dataloader)
+        batch = next(random_iterator)
+    return batch, random_iterator
+
+
 def process_batch(batch_raw, device, train_mode="initialization"):
     use_history = train_mode == "prediction"
     history_data = batch_raw[0].to(device, non_blocking=True) if use_history else None
@@ -945,6 +1117,25 @@ def process_batch(batch_raw, device, train_mode="initialization"):
         if len(batch_raw) > 15
         else None
     )
+    state_scales = (
+        batch_raw[16].to(device, non_blocking=True)
+        if len(batch_raw) > 16
+        else torch.stack(
+            [
+                scene_stats[:, 2].abs().clamp_min(1e-6),
+                torch.full_like(scene_stats[:, 2], 15.0),
+                torch.full_like(scene_stats[:, 2], float(np.pi)),
+            ],
+            dim=1,
+        )
+    )
+    map_lanelet_id = batch_raw[17].to(device, non_blocking=True) if len(batch_raw) > 17 else None
+    map_lane_subtype = batch_raw[18].to(device, non_blocking=True) if len(batch_raw) > 18 else None
+    map_left_boundary_type = batch_raw[19].to(device, non_blocking=True) if len(batch_raw) > 19 else None
+    map_right_boundary_type = batch_raw[20].to(device, non_blocking=True) if len(batch_raw) > 20 else None
+    lane_edge_index = batch_raw[21].to(device, non_blocking=True) if len(batch_raw) > 21 else None
+    lane_edge_type = batch_raw[22].to(device, non_blocking=True) if len(batch_raw) > 22 else None
+    lane_edge_mask = batch_raw[23].to(device, non_blocking=True) if len(batch_raw) > 23 else None
     raw_labels = labels.clone()
     raw_agent_types = agent_types.clone()
 
@@ -973,8 +1164,16 @@ def process_batch(batch_raw, device, train_mode="initialization"):
         "loss_timestep_mask": loss_timestep_mask.bool(),
         "history_timestep_mask": history_timestep_mask.bool() if history_timestep_mask is not None else None,
         "static_dimensions": static_dimensions,
+        "state_scales": state_scales,
         "map_type": map_type,
         "map_speed_limit": map_speed_limit,
+        "map_lanelet_id": map_lanelet_id,
+        "map_lane_subtype": map_lane_subtype,
+        "map_left_boundary_type": map_left_boundary_type,
+        "map_right_boundary_type": map_right_boundary_type,
+        "lane_edge_index": lane_edge_index,
+        "lane_edge_type": lane_edge_type,
+        "lane_edge_mask": lane_edge_mask,
     }
 
 
@@ -982,17 +1181,29 @@ def decode_prediction_states(states, batch, args, timestep_mask=None):
     representation = getattr(args, "prediction_representation", "absolute")
     if args.train_mode != "prediction" or representation == "absolute":
         return states
-    if representation != "delta":
-        raise ValueError(f"unsupported prediction representation: {representation}")
     history_timestep_mask = batch.get("history_timestep_mask")
     if history_timestep_mask is None:
-        raise ValueError("delta prediction requires an explicit history_timestep_mask")
-    return decode_state_deltas_torch(
-        states,
-        batch["history_data"],
-        batch["timestep_mask"] if timestep_mask is None else timestep_mask,
-        history_timestep_mask,
-    )
+        raise ValueError(
+            f"{representation} prediction requires an explicit history_timestep_mask"
+        )
+    decode_mask = batch["timestep_mask"] if timestep_mask is None else timestep_mask
+    if representation == "delta":
+        return decode_state_deltas_torch(
+            states,
+            batch["history_data"],
+            decode_mask,
+            history_timestep_mask,
+            yaw_scale=batch["state_scales"][:, 2],
+        )
+    if representation == "cv_residual":
+        return decode_constant_velocity_residual_torch(
+            states,
+            batch["history_data"],
+            decode_mask,
+            history_timestep_mask,
+            yaw_scale=batch["state_scales"][:, 2],
+        )
+    raise ValueError(f"unsupported prediction representation: {representation}")
 
 
 def _method_keyword_names(model, method_name):
@@ -1058,6 +1269,15 @@ def build_model_context_kwargs(
         "loss_timestep_mask": loss_mask if not for_sampling else None,
         "scene_stats": batch.get("scene_stats"),
         "static_dimensions": batch.get("static_dimensions"),
+        "state_scales": batch.get("state_scales"),
+        "map_speed_limit": batch.get("map_speed_limit"),
+        "map_lanelet_id": batch.get("map_lanelet_id"),
+        "map_lane_subtype": batch.get("map_lane_subtype"),
+        "map_left_boundary_type": batch.get("map_left_boundary_type"),
+        "map_right_boundary_type": batch.get("map_right_boundary_type"),
+        "lane_edge_index": batch.get("lane_edge_index"),
+        "lane_edge_type": batch.get("lane_edge_type"),
+        "lane_edge_mask": batch.get("lane_edge_mask"),
     }
     if use_history:
         model_kwargs["history_data"] = batch["history_data"]
@@ -1123,6 +1343,18 @@ def save_samples_npz(model_single, batch, args, z_shapes, device, step):
     sample_labels = batch["labels"][:batch_size]
     sample_raw_labels = batch["raw_labels"][:batch_size]
     sample_scene_stats = batch["scene_stats"][:batch_size]
+    sample_state_scales = batch.get("state_scales")
+    if sample_state_scales is None:
+        sample_state_scales = torch.stack(
+            [
+                sample_scene_stats[:, 2].abs().clamp_min(1e-6),
+                torch.full_like(sample_scene_stats[:, 2], 15.0),
+                torch.full_like(sample_scene_stats[:, 2], float(np.pi)),
+            ],
+            dim=1,
+        )
+    else:
+        sample_state_scales = sample_state_scales[:batch_size]
     sample_map_name = batch["map_name"][:batch_size] if hasattr(batch["map_name"], "__len__") else batch["map_name"]
     sample_gt = batch["target_data"][:batch_size]
     sample_map_type = batch["map_type"][:batch_size]
@@ -1138,6 +1370,7 @@ def save_samples_npz(model_single, batch, args, z_shapes, device, step):
         "timestep_mask": batch["timestep_mask"][:batch_size],
         "loss_timestep_mask": batch.get("loss_timestep_mask", batch["timestep_mask"])[:batch_size],
         "scene_stats": batch["scene_stats"][:batch_size],
+        "state_scales": sample_state_scales,
         "static_dimensions": (
             batch["static_dimensions"][:batch_size]
             if batch.get("static_dimensions") is not None else None
@@ -1157,6 +1390,14 @@ def save_samples_npz(model_single, batch, args, z_shapes, device, step):
             if args.train_mode == "prediction" and batch.get("history_timestep_mask") is not None
             else None
         ),
+        "map_speed_limit": batch.get("map_speed_limit")[:batch_size] if batch.get("map_speed_limit") is not None else None,
+        "map_lanelet_id": batch.get("map_lanelet_id")[:batch_size] if batch.get("map_lanelet_id") is not None else None,
+        "map_lane_subtype": batch.get("map_lane_subtype")[:batch_size] if batch.get("map_lane_subtype") is not None else None,
+        "map_left_boundary_type": batch.get("map_left_boundary_type")[:batch_size] if batch.get("map_left_boundary_type") is not None else None,
+        "map_right_boundary_type": batch.get("map_right_boundary_type")[:batch_size] if batch.get("map_right_boundary_type") is not None else None,
+        "lane_edge_index": batch.get("lane_edge_index")[:batch_size] if batch.get("lane_edge_index") is not None else None,
+        "lane_edge_type": batch.get("lane_edge_type")[:batch_size] if batch.get("lane_edge_type") is not None else None,
+        "lane_edge_mask": batch.get("lane_edge_mask")[:batch_size] if batch.get("lane_edge_mask") is not None else None,
     }
     sample_model_kwargs = build_model_context_kwargs(
         sample_batch,
@@ -1177,18 +1418,28 @@ def save_samples_npz(model_single, batch, args, z_shapes, device, step):
     unconditional_samples = []
 
     with preserving_rng_state(), evaluating(model_single):
-        for _ in range(args.n_modes):
+        sample_seed = int(getattr(args, "sample_seed", 12345))
+        if sample_seed >= 0:
+            torch.manual_seed(sample_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(sample_seed)
+        for mode_sample_index in range(args.n_modes):
             z_cond = sample_latents(batch_size, z_shapes, device, args.temp, args.temp_block_decay)
+            route_reverse_kwargs = {}
+            if getattr(args, "model_arch", "mapglow") == "route_mixture_glow":
+                route_reverse_kwargs["mode_index"] = mode_sample_index % args.route_modes
             if label_condition_used:
                 cond_sample = model_single.reverse(
                     z_cond,
                     sample_labels,
                     guidance_scale=args.cfg_scale,
+                    **route_reverse_kwargs,
                     **sample_model_kwargs,
                 ).detach()
             else:
                 cond_sample = model_single.reverse(
                     z_cond,
+                    **route_reverse_kwargs,
                     **sample_model_kwargs,
                 ).detach()
             cond_sample = decode_prediction_states(
@@ -1202,6 +1453,7 @@ def save_samples_npz(model_single, batch, args, z_shapes, device, step):
             z_uncond = sample_latents(batch_size, z_shapes, device, args.temp, args.temp_block_decay)
             uncond_sample = model_single.reverse(
                 z_uncond,
+                **route_reverse_kwargs,
                 **sample_model_kwargs,
             ).detach()
             uncond_sample = decode_prediction_states(
@@ -1214,6 +1466,14 @@ def save_samples_npz(model_single, batch, args, z_shapes, device, step):
 
     conditional_samples = np.stack(conditional_samples, axis=0)
     unconditional_samples = np.stack(unconditional_samples, axis=0)
+    route_save_payload = {}
+    if getattr(args, "model_arch", "mapglow") == "route_mixture_glow":
+        route_outputs = model_single._route_outputs(**sample_model_kwargs)
+        route_save_payload = {
+            "route_probabilities": route_outputs["route_probabilities"].detach().cpu().numpy(),
+            "route_logits": route_outputs["route_logits"].detach().cpu().numpy(),
+            "route_proposals_cv_residual": route_outputs["proposal"].detach().cpu().numpy(),
+        }
     saved_gt_tensor = decode_prediction_states(sample_gt, sample_batch, args)
     saved_gt = np.array(saved_gt_tensor.cpu().data)
     saved_timestep_mask = np.array(sample_batch["timestep_mask"].cpu().data)
@@ -1239,6 +1499,7 @@ def save_samples_npz(model_single, batch, args, z_shapes, device, step):
         agent_types=np.array(sample_batch["raw_agent_types"].cpu().data),
         model_agent_types=np.array(sample_batch["agent_types"].cpu().data),
         scene_stats=np.array(sample_scene_stats.cpu().data),
+        state_scales=np.array(sample_batch["state_scales"].cpu().data),
         map_name=np.array(sample_map_name),
         target_vehicle_mask=np.array(sample_batch["target_vehicle_mask"].cpu().data),
         context_agent_mask=np.array(sample_batch["context_agent_mask"].cpu().data),
@@ -1257,6 +1518,8 @@ def save_samples_npz(model_single, batch, args, z_shapes, device, step):
         model_output_representation=np.asarray(
             getattr(args, "prediction_representation", "absolute")
         ),
+        model_arch=np.asarray(getattr(args, "model_arch", "mapglow")),
+        **route_save_payload,
     )
     if args.train_mode == "prediction":
         save_dict["history_data"] = np.array(sample_batch["history_data"].cpu().data)
@@ -1578,18 +1841,35 @@ def save_sample_visualizations(
     print(f"[samples] saved images to {image_dir}")
 
 
-def trajectory_metric_sums(samples, target, timestep_mask, agent_mask, position_scale):
-    """Return agent-weighted top-1 and best-of-K ADE/FDE sums."""
+def trajectory_metric_sums(
+    samples,
+    target,
+    timestep_mask,
+    agent_mask,
+    position_scale,
+    *,
+    history=None,
+    history_timestep_mask=None,
+    velocity_scale=None,
+    yaw_scale=None,
+    turn_angle_threshold_deg=30.0,
+    timestep_seconds=0.1,
+):
+    """Return trajectory, turning, and kinematic diagnostic sums."""
     if samples.ndim != 5 or target.ndim != 4:
         raise ValueError("samples/target must be [K,B,C,T,V] and [B,C,T,V]")
     steps = min(samples.shape[3], target.shape[2], timestep_mask.shape[1])
-    samples = samples[:, :, :2, :steps]
-    target = target[:, :2, :steps]
+    full_samples = samples[:, :, :, :steps]
+    full_target = target[:, :, :steps]
+    sample_xy = full_samples[:, :, :2]
+    target_xy = full_target[:, :2]
     mask = timestep_mask[:, :steps].bool()
     valid_agent = mask.any(dim=1) & agent_mask.bool()
 
-    scale = position_scale.to(samples).reshape(1, -1, 1, 1)
-    error = torch.linalg.vector_norm(samples - target.unsqueeze(0), dim=2) * scale
+    scale = position_scale.to(sample_xy).reshape(1, -1, 1, 1)
+    error = torch.linalg.vector_norm(
+        sample_xy - target_xy.unsqueeze(0), dim=2
+    ) * scale
     masked_error = error * mask.unsqueeze(0)
     counts = mask.sum(dim=1).clamp_min(1).unsqueeze(0)
     ade = masked_error.sum(dim=2) / counts
@@ -1601,18 +1881,121 @@ def trajectory_metric_sums(samples, target, timestep_mask, agent_mask, position_
         index=last_index.unsqueeze(0).expand(error.shape[0], -1, -1).unsqueeze(2),
     ).squeeze(2)
     valid = valid_agent.to(error.dtype)
-    count = valid.sum()
-    return {
-        "agent_count": count,
+    result = {
+        "agent_count": valid.sum(),
         "ade_sum": (ade[0] * valid).sum(),
         "fde_sum": (fde[0] * valid).sum(),
         "minade_sum": (ade.min(dim=0).values * valid).sum(),
         "minfde_sum": (fde.min(dim=0).values * valid).sum(),
     }
 
+    if (
+        history is not None
+        and history_timestep_mask is not None
+        and full_target.shape[1] > 4
+    ):
+        history_mask = history_timestep_mask.bool()
+        hist_time = torch.arange(history.shape[2], device=history.device).view(1, -1, 1)
+        last_hist_idx = torch.where(history_mask, hist_time, -1).amax(dim=1).clamp_min(0)
+        history_yaw = torch.gather(
+            history[:, 4], 1, last_hist_idx.unsqueeze(1)
+        ).squeeze(1)
+        target_yaw = torch.gather(
+            full_target[:, 4], 1, last_index.unsqueeze(1)
+        ).squeeze(1)
+        sample_yaw = torch.gather(
+            full_samples[:, :, 4],
+            2,
+            last_index.unsqueeze(0).unsqueeze(2).expand(
+                full_samples.shape[0], -1, 1, -1
+            ),
+        ).squeeze(2)
+        yaw_scale_tensor = (
+            yaw_scale.to(target_yaw).view(-1, 1)
+            if yaw_scale is not None
+            else torch.full(
+                (target_yaw.shape[0], 1), torch.pi,
+                dtype=target_yaw.dtype, device=target_yaw.device,
+            )
+        )
+        target_turn = torch.abs(
+            torch.remainder(
+                (target_yaw - history_yaw) * yaw_scale_tensor + torch.pi,
+                2 * torch.pi,
+            ) - torch.pi
+        )
+        sample_turn = torch.abs(
+            torch.remainder(
+                (sample_yaw - history_yaw.unsqueeze(0))
+                * yaw_scale_tensor.unsqueeze(0) + torch.pi,
+                2 * torch.pi,
+            ) - torch.pi
+        )
+        threshold = torch.deg2rad(
+            target_turn.new_tensor(float(turn_angle_threshold_deg))
+        )
+        turning = valid_agent & (target_turn > threshold)
+        turning_f = turning.to(error.dtype)
+        result.update(
+            turn_agent_count=turning_f.sum(),
+            turn_covered_sum=(
+                (sample_turn > threshold).any(dim=0) & turning
+            ).to(error.dtype).sum(),
+            turn_minade_sum=(ade.min(dim=0).values * turning_f).sum(),
+            turn_minfde_sum=(fde.min(dim=0).values * turning_f).sum(),
+        )
+
+    if full_target.shape[1] >= 4 and steps > 1:
+        consecutive = mask[:, 1:] & mask[:, :-1]
+        pair_count = consecutive.sum().to(error.dtype)
+        pos_scale = position_scale.to(full_target).view(-1, 1, 1, 1)
+        vel_scale = (
+            velocity_scale.to(full_target).view(-1, 1, 1, 1)
+            if velocity_scale is not None
+            else torch.full_like(pos_scale, 15.0)
+        )
+        target_implied_v = (
+            (full_target[:, :2, 1:] - full_target[:, :2, :-1])
+            * pos_scale
+            / float(timestep_seconds)
+        )
+        target_v = full_target[:, 2:4, 1:] * vel_scale
+        target_kinematic = torch.linalg.vector_norm(
+            target_implied_v - target_v, dim=1
+        )
+
+        sample_pos_scale = position_scale.to(full_samples).view(1, -1, 1, 1, 1)
+        sample_vel_scale = (
+            velocity_scale.to(full_samples).view(1, -1, 1, 1, 1)
+            if velocity_scale is not None
+            else torch.full_like(sample_pos_scale, 15.0)
+        )
+        sample_implied_v = (
+            (full_samples[:, :, :2, 1:] - full_samples[:, :, :2, :-1])
+            * sample_pos_scale
+            / float(timestep_seconds)
+        )
+        sample_v = full_samples[:, :, 2:4, 1:] * sample_vel_scale
+        sample_kinematic = torch.linalg.vector_norm(
+            sample_implied_v - sample_v, dim=2
+        )
+        result.update(
+            target_kinematic_sum=(
+                target_kinematic * consecutive.to(target_kinematic.dtype)
+            ).sum(),
+            target_kinematic_count=pair_count,
+            sample_kinematic_sum=(
+                sample_kinematic
+                * consecutive.unsqueeze(0).to(sample_kinematic.dtype)
+            ).sum(),
+            sample_kinematic_count=pair_count * full_samples.shape[0],
+        )
+
+    return result
+
 
 def evaluate_validation(model_single, dataloader, args, z_shapes, device, is_distributed=False):
-    totals = torch.zeros(8, dtype=torch.float64, device=device)
+    totals = torch.zeros(16, dtype=torch.float64, device=device)
     max_batches = int(args.val_max_batches) if args.val_max_batches > 0 else None
     with preserving_rng_state(), evaluating(model_single):
         for batch_index, batch_raw in enumerate(dataloader):
@@ -1652,7 +2035,7 @@ def evaluate_validation(model_single, dataloader, args, z_shapes, device, is_dis
                     future_steps=args.future_steps,
                 )
                 samples = []
-                for _ in range(args.val_num_modes):
+                for mode_sample_index in range(args.val_num_modes):
                     z = sample_latents(
                         batch["target_data"].shape[0],
                         z_shapes,
@@ -1660,7 +2043,10 @@ def evaluate_validation(model_single, dataloader, args, z_shapes, device, is_dis
                         args.temp,
                         args.temp_block_decay,
                     )
-                    sample = model_single.reverse(z, **reverse_kwargs)
+                    route_reverse_kwargs = {}
+                    if getattr(args, "model_arch", "mapglow") == "route_mixture_glow":
+                        route_reverse_kwargs["mode_index"] = mode_sample_index % args.route_modes
+                    sample = model_single.reverse(z, **route_reverse_kwargs, **reverse_kwargs)
                     samples.append(
                         decode_prediction_states(
                             sample,
@@ -1685,12 +2071,25 @@ def evaluate_validation(model_single, dataloader, args, z_shapes, device, is_dis
                     batch["loss_timestep_mask"],
                     batch["context_agent_mask"],
                     scale,
+                    history=batch.get("history_data"),
+                    history_timestep_mask=batch.get("history_timestep_mask"),
+                    velocity_scale=batch.get("state_scales")[:, 1],
+                    yaw_scale=batch.get("state_scales")[:, 2],
+                    turn_angle_threshold_deg=args.turn_angle_threshold_deg,
                 )
                 totals[3] += metric["ade_sum"].double()
                 totals[4] += metric["fde_sum"].double()
                 totals[5] += metric["minade_sum"].double()
                 totals[6] += metric["minfde_sum"].double()
                 totals[7] += metric["agent_count"].double()
+                totals[8] += metric.get("turn_covered_sum", 0.0)
+                totals[9] += metric.get("turn_agent_count", 0.0)
+                totals[10] += metric.get("turn_minade_sum", 0.0)
+                totals[11] += metric.get("turn_minfde_sum", 0.0)
+                totals[12] += metric.get("sample_kinematic_sum", 0.0)
+                totals[13] += metric.get("sample_kinematic_count", 0.0)
+                totals[14] += metric.get("target_kinematic_sum", 0.0)
+                totals[15] += metric.get("target_kinematic_count", 0.0)
 
     if is_distributed:
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
@@ -1707,6 +2106,18 @@ def evaluate_validation(model_single, dataloader, args, z_shapes, device, is_dis
             minade=float((totals[5] / totals[7]).item()),
             minfde=float((totals[6] / totals[7]).item()),
         )
+    if totals[9] > 0:
+        metrics.update(
+            turn_recall=float((totals[8] / totals[9]).item()),
+            turn_minade=float((totals[10] / totals[9]).item()),
+            turn_minfde=float((totals[11] / totals[9]).item()),
+            turn_agent_count=int(totals[9].item()),
+        )
+    if totals[13] > 0 and totals[15] > 0:
+        metrics.update(
+            sample_kinematic_error=float((totals[12] / totals[13]).item()),
+            target_kinematic_error=float((totals[14] / totals[15]).item()),
+        )
     if not all(np.isfinite(value) for value in metrics.values()):
         raise FloatingPointError(f"non-finite validation metrics: {metrics}")
     return metrics
@@ -1718,10 +2129,36 @@ def validate_training_args(args):
         value = int(getattr(args, name))
         if value <= 0:
             raise ValueError(f"{name} must be > 0, got {value}")
+    if args.route_modes <= 0 or args.route_modes > 9:
+        raise ValueError("route_modes must be in [1,9] for the route-id conditioner embedding")
+    if args.route_hidden_dim <= 0 or args.route_hidden_dim % 8 != 0:
+        raise ValueError("route_hidden_dim must be positive and divisible by 8")
+    if args.mixture_chunk_size <= 0:
+        raise ValueError("mixture_chunk_size must be positive")
+    for name in (
+        "proposal_loss_weight", "route_classification_loss_weight",
+        "proposal_smoothness_loss_weight", "proposal_diversity_loss_weight",
+        "proposal_map_compliance_loss_weight",
+    ):
+        value = float(getattr(args, name))
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and non-negative")
+    if args.model_arch == "route_mixture_glow":
+        if args.train_mode != "prediction" or args.prediction_representation != "cv_residual":
+            raise ValueError("route_mixture_glow requires prediction mode with cv_residual targets")
+        if args.n_modes < args.route_modes:
+            raise ValueError("n_modes must cover every route component")
     if args.start_epoch < 0 or args.start_iter < 0:
         raise ValueError("start_epoch and start_iter must be >= 0")
     if args.lr <= 0 or not np.isfinite(args.lr):
         raise ValueError(f"lr must be finite and > 0, got {args.lr}")
+    if getattr(args, "warmup_steps", 0) < 0:
+        raise ValueError(f"warmup_steps must be >= 0, got {args.warmup_steps}")
+    min_lr_ratio = float(getattr(args, "min_lr_ratio", 0.05))
+    if not np.isfinite(min_lr_ratio) or not 0.0 < min_lr_ratio <= 1.0:
+        raise ValueError(
+            f"min_lr_ratio must be finite and in (0, 1], got {min_lr_ratio}"
+        )
     if args.grad_clip_norm <= 0 or not np.isfinite(args.grad_clip_norm):
         raise ValueError(f"grad_clip_norm must be finite and > 0, got {args.grad_clip_norm}")
     if args.amp_init_scale <= 0 or not np.isfinite(args.amp_init_scale):
@@ -1753,8 +2190,12 @@ def validate_training_args(args):
             "prediction mode models only the five dynamic channels (x,y,vx,vy,yaw); "
             "length/width are supplied as static_dimensions context"
         )
-    if getattr(args, "prediction_representation", "absolute") not in ("absolute", "delta"):
-        raise ValueError("prediction_representation must be absolute or delta")
+    if getattr(args, "prediction_representation", "absolute") not in (
+        "absolute", "delta", "cv_residual",
+    ):
+        raise ValueError(
+            "prediction_representation must be absolute, delta, or cv_residual"
+        )
     if args.train_mode == "prediction" and args.prediction_target_steps % (2 ** args.n_block) != 0:
         raise ValueError(
             "prediction_target_steps must be divisible by 2**n_block. "
@@ -1769,6 +2210,11 @@ def validate_training_args(args):
             raise ValueError(f"{name} has invalid negative value {getattr(args, name)}")
     if args.val_batch < 0 or args.val_num_modes < 0:
         raise ValueError("val_batch and val_num_modes must be >= 0")
+    if args.sample_interval > 0 and not args.val_combined_path:
+        raise ValueError(
+            "sample_interval > 0 requires val_combined_path because periodic "
+            "inference is not allowed to use training batches"
+        )
 
 
 def train(local_rank, world_size, args, rank=None):
@@ -1799,6 +2245,9 @@ def train(local_rank, world_size, args, rank=None):
     args.label_source = dataset.label_source
     val_dataloader = None
     val_sampler = None
+    fixed_sample_batch_raw = None
+    random_val_sample_dataloader = None
+    random_val_sample_iterator = None
     if args.val_combined_path:
         val_dataloader, val_sampler, val_dataset = build_dataloader(
             args,
@@ -1815,6 +2264,13 @@ def train(local_rank, world_size, args, rank=None):
             or val_dataset.max_agents != dataset.max_agents
         ):
             raise ValueError("validation dataset target shape must match the training dataset")
+        if is_main:
+            if getattr(args, "fixed_validation_samples", True):
+                fixed_sample_batch_raw = next(iter(val_dataloader))
+            else:
+                random_val_sample_dataloader = (
+                    build_random_validation_sample_dataloader(val_dataset, args)
+                )
 
     if args.img_size_h <= 0:
         args.img_size_h = dataset.time_steps
@@ -1831,6 +2287,12 @@ def train(local_rank, world_size, args, rank=None):
             "Use -1 to infer it from the dataset."
         )
 
+    model_arch = getattr(args, "model_arch", "mapglow")
+    model_class = (
+        RouteMixtureGlow
+        if model_arch == "route_mixture_glow"
+        else Glow
+    )
     glow_kwargs = dict(
         in_channel=args.in_channel,
         condition_dim=32,
@@ -1839,13 +2301,20 @@ def train(local_rank, world_size, args, rank=None):
         affine=args.affine,
         conv_lu=not args.no_lu,
     )
-    if "history_input_dim" in inspect.signature(Glow.__init__).parameters:
+    if "history_input_dim" in inspect.signature(model_class.__init__).parameters:
         glow_kwargs["history_input_dim"] = args.in_channel
-    model_single = Glow(**glow_kwargs)
+    if model_arch == "route_mixture_glow":
+        glow_kwargs.update(
+            route_modes=args.route_modes,
+            future_steps=args.prediction_target_steps,
+            hidden_dim=args.route_hidden_dim,
+            mixture_chunk_size=args.mixture_chunk_size,
+        )
+    model_single = model_class(**glow_kwargs)
     model_single.to(device)
 
     optimizer = torch.optim.AdamW(model_single.parameters(), lr=args.lr, weight_decay=1e-6)
-    scheduler = StepLR(optimizer, step_size=10000, gamma=0.96)
+    scheduler = build_lr_scheduler(optimizer, args, len(dataloader))
 
     use_amp = args.amp and torch.cuda.is_available()
     scaler = make_grad_scaler(
@@ -2031,7 +2500,7 @@ def train(local_rank, world_size, args, rank=None):
             condition_input = labels if use_conditional else None
 
             with cuda_autocast(enabled=use_amp):
-                log_p, logdet, _ = model(
+                log_p, logdet, model_aux = model(
                     target_data,
                     condition=condition_input,
                     **build_model_context_kwargs(
@@ -2045,6 +2514,15 @@ def train(local_rank, world_size, args, rank=None):
                     loss_value = nll_per_valid_dim.mean()
                 else:
                     loss_value = nll_per_scene.mean()
+                if isinstance(model_aux, dict) and "proposal_loss" in model_aux:
+                    loss_value = (
+                        loss_value
+                        + args.proposal_loss_weight * model_aux["proposal_loss"]
+                        + args.route_classification_loss_weight * model_aux["route_classification_loss"]
+                        + args.proposal_smoothness_loss_weight * model_aux["proposal_smoothness_loss"]
+                        + args.proposal_diversity_loss_weight * model_aux["proposal_diversity_loss"]
+                        + args.proposal_map_compliance_loss_weight * model_aux["proposal_map_compliance_loss"]
+                    )
 
             bad_loss = (
                 not torch.isfinite(loss_value)
@@ -2100,6 +2578,30 @@ def train(local_rank, world_size, args, rank=None):
                     writer.add_scalar("train/nll_per_valid_dim", nll_dim_mean.item(), global_step)
                     writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
                     writer.add_scalar("train/epoch", epoch, global_step)
+                    if isinstance(model_aux, dict) and "proposal_loss" in model_aux:
+                        writer.add_scalar("train/proposal_loss", model_aux["proposal_loss"].item(), global_step)
+                        writer.add_scalar("train/route_classification_loss", model_aux["route_classification_loss"].item(), global_step)
+                        writer.add_scalar("train/proposal_smoothness_loss", model_aux["proposal_smoothness_loss"].item(), global_step)
+                        writer.add_scalar("train/proposal_diversity_loss", model_aux["proposal_diversity_loss"].item(), global_step)
+                        writer.add_scalar("train/proposal_map_compliance_loss", model_aux["proposal_map_compliance_loss"].item(), global_step)
+                        route_entropy = -(
+                            model_aux["route_probabilities"]
+                            * model_aux["route_probabilities"].clamp_min(1e-9).log()
+                        ).sum(-1).mean()
+                        writer.add_scalar("train/route_entropy", route_entropy.item(), global_step)
+                route_metrics = {}
+                if isinstance(model_aux, dict) and "proposal_loss" in model_aux:
+                    route_prob = model_aux["route_probabilities"]
+                    route_entropy = -(route_prob * route_prob.clamp_min(1e-9).log()).sum(-1).mean()
+                    route_metrics = {
+                        "proposal_loss": float(model_aux["proposal_loss"].item()),
+                        "route_classification_loss": float(model_aux["route_classification_loss"].item()),
+                        "proposal_smoothness_loss": float(model_aux["proposal_smoothness_loss"].item()),
+                        "proposal_diversity_loss": float(model_aux["proposal_diversity_loss"].item()),
+                        "proposal_map_compliance_loss": float(model_aux["proposal_map_compliance_loss"].item()),
+                        "route_entropy": float(route_entropy.item()),
+                        "effective_route_modes": float(torch.exp(route_entropy).item()),
+                    }
                 append_jsonl(
                     metrics_path,
                     {
@@ -2113,12 +2615,32 @@ def train(local_rank, world_size, args, rank=None):
                         "nll_per_valid_dim": float(nll_dim_mean.item()),
                         "grad_norm": float(grad_norm.item()),
                         "lr": float(optimizer.param_groups[0]["lr"]),
+                        **route_metrics,
                     },
                 )
 
             if is_main and args.sample_interval > 0 and completed_step % args.sample_interval == 0:
                 with torch.no_grad():
-                    save_samples_npz(model_single, batch, args, z_shapes, device, completed_step - 1)
+                    sample_batch_raw, random_val_sample_iterator = (
+                        next_validation_sample_batch(
+                            fixed_sample_batch_raw,
+                            random_val_sample_dataloader,
+                            random_val_sample_iterator,
+                        )
+                    )
+                    sample_batch = process_batch(
+                        sample_batch_raw,
+                        device,
+                        train_mode=args.train_mode,
+                    )
+                    save_samples_npz(
+                        model_single,
+                        sample_batch,
+                        args,
+                        z_shapes,
+                        device,
+                        completed_step - 1,
+                    )
 
             if is_main and args.save_interval > 0 and completed_step % args.save_interval == 0:
                 ckpt_dir = Path(args.ckpt_dir)
@@ -2331,9 +2853,26 @@ def main():
     parser.add_argument("--start_iter", default=0, type=int, help="global step to start logging/checkpoint numbering")
     parser.add_argument("--n_flow", default=16, type=int, help="number of flows per block")
     parser.add_argument("--n_block", default=3, type=int, help="number of blocks")
+    parser.add_argument("--model_arch", default="mapglow", choices=["mapglow", "route_mixture_glow"],
+                        help="model architecture; route_mixture_glow requires v5 LaneGraph data")
+    parser.add_argument("--route_modes", default=6, type=int, help="route mixture component count")
+    parser.add_argument("--route_hidden_dim", default=256, type=int, help="query-centric encoder width")
+    parser.add_argument("--mixture_chunk_size", default=2, type=int,
+                        help="number of route components evaluated together")
+    parser.add_argument("--proposal_loss_weight", default=0.2, type=float)
+    parser.add_argument("--route_classification_loss_weight", default=0.05, type=float)
+    parser.add_argument("--proposal_smoothness_loss_weight", default=0.01, type=float)
+    parser.add_argument("--proposal_diversity_loss_weight", default=0.1, type=float)
+    parser.add_argument("--proposal_map_compliance_loss_weight", default=0.05, type=float)
     parser.add_argument("--no_lu", action="store_true", help="disable LU conv")
     parser.add_argument("--affine", action="store_true", help="use affine coupling")
     parser.add_argument("--lr", default=1e-4, type=float, help="learning rate")
+    parser.add_argument("--scheduler_type", default="step", choices=["step", "cosine"],
+                        help="learning-rate schedule")
+    parser.add_argument("--warmup_steps", default=0, type=int,
+                        help="linear warmup steps used by the cosine scheduler")
+    parser.add_argument("--min_lr_ratio", default=0.05, type=float,
+                        help="final/base LR ratio used by the cosine scheduler")
     parser.add_argument("--img_size_h", default=-1, type=int, help="time dimension, -1 means infer from dataset")
     parser.add_argument("--img_size_w", default=-1, type=int, help="agent dimension, -1 means infer from dataset")
     parser.add_argument(
@@ -2351,8 +2890,11 @@ def main():
     parser.add_argument(
         "--prediction_representation",
         default="absolute",
-        choices=["absolute", "delta"],
-        help="prediction target representation; delta accumulates from the last valid history state",
+        choices=["absolute", "delta", "cv_residual"],
+        help=(
+            "prediction target representation; cv_residual models a heading-aligned "
+            "residual around a constant-motion history baseline"
+        ),
     )
     parser.add_argument("--label_source", default="auto", choices=["auto", "none", "dataset", "target"],
                         help="label semantics: prediction always uses none; auto=dataset for initialization")
@@ -2383,6 +2925,13 @@ def main():
         help="disable interactive progress output; metrics are still written to JSONL/TensorBoard",
     )
     parser.add_argument("--sample_interval", default=2000, type=int, help="sample save interval")
+    parser.add_argument("--sample_seed", default=12345, type=int,
+                        help="fixed latent seed for comparable periodic samples; negative disables")
+    parser.add_argument("--fixed_validation_samples", action=argparse.BooleanOptionalAction, default=True,
+                        help=(
+                            "use the same first validation batch for periodic samples; "
+                            "when false, draw shuffled batches from validation only"
+                        ))
     parser.add_argument("--save_interval", default=2000, type=int, help="checkpoint save interval")
     parser.add_argument("--save_epoch_interval", default=1, type=int, help="save last.pt every N epochs; <=0 disables")
     parser.add_argument("--val_combined_path", default="", type=str,

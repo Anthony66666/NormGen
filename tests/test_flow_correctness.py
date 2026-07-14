@@ -13,6 +13,7 @@ from MapGlow11_27_original import (  # noqa: E402
     ActNorm,
     AffineCoupling,
     AgentInteractionModule,
+    Block,
     ContextEncoder,
     Flow,
     Glow,
@@ -54,6 +55,13 @@ class ProbabilityAndAngleTest(unittest.TestCase):
         )
         self.assertAlmostEqual(relative[0, 0, 0, 1, 4].item(), -math.pi / 2, places=6)
         self.assertAlmostEqual(relative[0, 0, 1, 0, 4].item(), math.pi / 2, places=6)
+
+        scaled = module.compute_relative_features(
+            trajectory,
+            torch.ones(1, 2, dtype=torch.bool),
+            yaw_scale=torch.tensor([2.0]),
+        )
+        self.assertAlmostEqual(scaled[0, 0, 0, 1, 4].item(), -1.0, places=6)
 
 
 class InvertiblePrimitiveTest(unittest.TestCase):
@@ -216,6 +224,99 @@ class ConditionerCorrectnessTest(unittest.TestCase):
         expected = anchor.unsqueeze(1).expand(1, 3, 2, 2).reshape(3, 2, 2)
         torch.testing.assert_close(captured["coordinates"], expected)
         self.assertFalse(torch.allclose(captured["coordinates"], in_a[:, :2].permute(0, 2, 3, 1).reshape(3, 2, 2)))
+
+    def test_coupling_rope_projects_each_future_token_in_metric_space(self):
+        coupling = AffineCoupling(4, condition_dim=8, filter_size=32).eval()
+        captured = {}
+        rope = coupling.spatiotemporal_extractor.spatial_attn_rope
+        original_forward = rope.forward
+
+        def capture_forward(features, coordinates, key_padding_mask=None):
+            captured["coordinates"] = coordinates.detach().clone()
+            return original_forward(
+                features, coordinates, key_padding_mask=key_padding_mask
+            )
+
+        rope.forward = capture_forward
+        anchor = torch.tensor([[[10.0, -3.0], [4.0, 7.0]]])
+        step = torch.tensor([[[2.0, 0.5], [-1.0, 1.0]]])
+        coupling._compute_affine_params(
+            torch.randn(1, 2, 3, 2),
+            torch.ones(1, 2, dtype=torch.bool),
+            {
+                "kv": None,
+                "kv_mask": None,
+                "agent_rope_xy": anchor,
+                "agent_rope_step_xy": step,
+                "agent_valid_mask": torch.ones(1, 2, dtype=torch.bool),
+            },
+        )
+
+        offsets = torch.tensor([1.5, 3.5, 5.5]).view(3, 1, 1)
+        expected = anchor[0].unsqueeze(0) + offsets * step[0].unsqueeze(0)
+        torch.testing.assert_close(captured["coordinates"], expected)
+        self.assertAlmostEqual(
+            coupling.spatiotemporal_extractor.spatial_attn_rope.m2idx_x.item(),
+            2.0 * math.pi / 100.0,
+            places=6,
+        )
+
+    def test_lane_selection_keeps_history_reachable_distant_lane(self):
+        encoder = ContextEncoder(
+            filter_size=32, num_heads=8, history_input_dim=5, topk_lanes=1
+        )
+        lane_features = torch.randn(1, 2, 32)
+        map_data = torch.zeros(1, 2, 1, 6)
+        map_data[0, 0, 0, :2] = torch.tensor([0.0, 0.2])
+        map_data[0, 1, 0, :2] = torch.tensor([3.0, 0.0])
+        map_mask = torch.ones(1, 2, 1, dtype=torch.bool)
+
+        _, lane_pad, selected_data, selected_mask = encoder._select_topk_lanes(
+            lane_features,
+            map_data,
+            map_mask,
+            agent_xy=torch.zeros(1, 1, 2),
+            agent_step_xy=torch.tensor([[[0.1, 0.0]]]),
+            agent_valid_mask=torch.ones(1, 1, dtype=torch.bool),
+            anchor_valid_mask=torch.ones(1, 1, dtype=torch.bool),
+        )
+
+        torch.testing.assert_close(
+            selected_data[0, 0, 0, 0, :2], torch.tensor([3.0, 0.0])
+        )
+        self.assertFalse(lane_pad.any())
+        self.assertTrue(selected_mask.all())
+
+    def test_conditional_base_prior_changes_with_context(self):
+        block = Block(
+            2, condition_dim=8, n_flow=1, split=True,
+            affine=True, conv_lu=True, history_input_dim=5,
+        ).eval()
+        first = block.prior_context_head[0]
+        last = block.prior_context_head[-1]
+        with torch.no_grad():
+            first.weight.zero_()
+            first.bias.zero_()
+            first.weight.copy_(torch.eye(first.weight.shape[0]))
+            last.weight.fill_(0.01)
+            last.bias.zero_()
+
+        base_context = {
+            "B": 1,
+            "V": 1,
+            "kv_mask": torch.zeros(1, 2, dtype=torch.bool),
+        }
+        zero_context = dict(base_context, kv=torch.zeros(1, 2, first.weight.shape[0]))
+        one_context = dict(base_context, kv=torch.ones(1, 2, first.weight.shape[0]))
+        zero_stats = block._conditional_prior_stats(
+            zero_context, time_steps=2, dtype=torch.float32, device=torch.device("cpu")
+        )
+        one_stats = block._conditional_prior_stats(
+            one_context, time_steps=2, dtype=torch.float32, device=torch.device("cpu")
+        )
+
+        self.assertEqual(tuple(one_stats.shape), (1, 4, 2, 1))
+        self.assertFalse(torch.allclose(zero_stats, one_stats))
 
     def test_train_mode_full_conditioner_is_deterministic_and_reconstructs(self):
         torch.manual_seed(7)

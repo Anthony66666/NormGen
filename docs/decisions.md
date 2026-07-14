@@ -9,3 +9,5 @@
 - Coupling RoPE never interprets latent channels as coordinates. It uses last-valid history anchors, multiplied by each scene's position scale so relative distances are expressed in metres; the global scene centre is unnecessary because RoPE centres coordinates internally.
 - FP32 remains the supported training path. AMP stays disabled until the RoPE SDPA attention-mask dtype is made FP16/BF16 compatible and separately validated.
 - Training datasets, checkpoints, generated NPZ files, PNGs, TensorBoard events, and other `artifacts/` outputs are local validation evidence and are not committed to Git.
+- The route model is a six-component joint-scene mixture. Each component translates the CV-residual target by a history/map-only proposal and evaluates a route-conditioned shared invertible Flow; the unit-Jacobian translation and component log-determinants remain inside the exact log-sum-exp.
+- v5 LaneGraph edges use shared Lanelet2 boundaries for left/right adjacency and metric endpoint/heading compatibility for successor/predecessor; topology overflow is an error rather than silent truncation.

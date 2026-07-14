@@ -8,12 +8,100 @@ import torch
 
 from train_combined import CombinedInteractionDataset, save_samples_npz
 from trajectory_representation import (
+    decode_constant_velocity_residual_torch,
     decode_state_deltas_torch,
+    encode_constant_velocity_residual_np,
     encode_state_deltas_np,
 )
 
 
 class IncrementalRepresentationTest(unittest.TestCase):
+    def test_cv_residual_round_trip_is_heading_aligned_and_yaw_continuous(self):
+        history = np.zeros((1, 5, 3, 1), dtype=np.float32)
+        history[0, :, 0, 0] = [0.0, 0.0, 1.0, 0.0, 0.90]
+        history[0, :, 1, 0] = [0.0, 0.1, 1.0, 0.0, 0.98]
+        history[0, :, 2, 0] = [0.0, 0.2, 1.0, 0.0, -0.98]
+        history_mask = np.ones((1, 3, 1), dtype=bool)
+
+        future = np.zeros((1, 5, 3, 1), dtype=np.float32)
+        future[0, :, 0, 0] = [0.0, 0.3, 1.0, 0.0, -0.90]
+        future[0, :, 1, 0] = [-0.02, 0.4, 0.8, 0.2, -0.80]
+        future[0, :, 2, 0] = [-0.08, 0.49, 0.5, 0.5, -0.65]
+        future_mask = np.ones((1, 3, 1), dtype=bool)
+
+        residual = encode_constant_velocity_residual_np(
+            future, history, future_mask, history_mask
+        )
+        # The first position follows the last observed displacement exactly.
+        np.testing.assert_allclose(residual[0, :2, 0, 0], 0.0, atol=1e-6)
+        # Crossing +pi/-pi remains a small continuous yaw residual.
+        self.assertGreater(float(residual[0, 4, 0, 0]), 0.0)
+        self.assertLess(float(residual[0, 4, 0, 0]), 0.2)
+
+        decoded = decode_constant_velocity_residual_torch(
+            torch.from_numpy(residual),
+            torch.from_numpy(history),
+            torch.from_numpy(future_mask),
+            torch.from_numpy(history_mask),
+        )
+        torch.testing.assert_close(decoded[:, :4], torch.from_numpy(future[:, :4]))
+        yaw_error = torch.remainder(
+            decoded[:, 4] - torch.from_numpy(future[:, 4]) + 1.0, 2.0
+        ) - 1.0
+        torch.testing.assert_close(yaw_error, torch.zeros_like(yaw_error), atol=1e-6, rtol=0)
+
+    def test_cv_residual_missing_future_does_not_shift_time_baseline(self):
+        history = np.zeros((1, 5, 2, 1), dtype=np.float32)
+        history[0, 0, :, 0] = [0.0, 0.1]
+        history_mask = np.ones((1, 2, 1), dtype=bool)
+        future = np.full((1, 5, 3, 1), -1.0, dtype=np.float32)
+        future[0, :, 0, 0] = [0.2, 0.0, 0.0, 0.0, 0.0]
+        future[0, :, 2, 0] = [0.4, 0.0, 0.0, 0.0, 0.0]
+        future_mask = np.array([[[True], [False], [True]]])
+
+        residual = encode_constant_velocity_residual_np(
+            future, history, future_mask, history_mask
+        )
+        np.testing.assert_allclose(residual[0, 0, [0, 2], 0], 0.0, atol=1e-6)
+        self.assertTrue(np.all(residual[:, :, 1] == -1.0))
+        decoded = decode_constant_velocity_residual_torch(
+            torch.from_numpy(residual),
+            torch.from_numpy(history),
+            torch.from_numpy(future_mask),
+            torch.from_numpy(history_mask),
+        ).numpy()
+        np.testing.assert_allclose(decoded[:, :, [0, 2]], future[:, :, [0, 2]], atol=1e-6)
+
+    def test_cv_residual_uses_dataset_yaw_scale_not_hardcoded_pi(self):
+        yaw_scale = 2.0
+        yaw_period = 2.0 * np.pi / yaw_scale
+        history = np.zeros((1, 5, 2, 1), dtype=np.float32)
+        history[0, :, 0, 0] = [0.0, 0.0, 0.0, 0.0, 0.70]
+        history[0, :, 1, 0] = [0.0, 0.1, 0.0, 0.0, 0.75]
+        future = np.zeros((1, 5, 2, 1), dtype=np.float32)
+        future[0, :, 0, 0] = [0.0, 0.2, 0.0, 0.0, -0.75]
+        future[0, :, 1, 0] = [-0.1, 0.25, 0.0, 0.0, -0.60]
+        history_mask = np.ones((1, 2, 1), dtype=bool)
+        future_mask = np.ones((1, 2, 1), dtype=bool)
+
+        residual = encode_constant_velocity_residual_np(
+            future, history, future_mask, history_mask, yaw_scale=yaw_scale
+        )
+        decoded = decode_constant_velocity_residual_torch(
+            torch.from_numpy(residual),
+            torch.from_numpy(history),
+            torch.from_numpy(future_mask),
+            torch.from_numpy(history_mask),
+            yaw_scale=torch.tensor([yaw_scale]),
+        )
+
+        torch.testing.assert_close(decoded[:, :4], torch.from_numpy(future[:, :4]))
+        yaw_error = torch.remainder(
+            decoded[:, 4] - torch.from_numpy(future[:, 4]) + yaw_period / 2.0,
+            yaw_period,
+        ) - yaw_period / 2.0
+        torch.testing.assert_close(yaw_error, torch.zeros_like(yaw_error), atol=1e-6, rtol=0)
+
     def test_round_trip_uses_last_valid_history_state_and_wraps_yaw(self):
         history = np.zeros((1, 5, 3, 1), dtype=np.float32)
         history[0, :, 0, 0] = [0.0, 0.0, 1.0, 0.0, 0.7]
